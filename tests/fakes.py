@@ -92,14 +92,18 @@ class FakeLLM:
 
 
 class FakeTTS:
-    """Returns 100 ms of silence per word, optionally slowly."""
+    """Returns 100 ms of silence per word, optionally slowly. Records the text and voice of each request."""
 
     def __init__(self, chunk_delay: float = 0.0) -> None:
         self.chunk_delay = chunk_delay
         self.texts: list[str] = []
+        self.voices: list[tuple[str, str]] = []
 
-    async def stream(self, text: str, *, sample_rate: int, **_: object) -> AsyncIterator[bytes]:
+    async def stream(
+        self, text: str, *, sample_rate: int, voice_id: str = "", model_id: str = "", **_: object
+    ) -> AsyncIterator[bytes]:
         self.texts.append(text)
+        self.voices.append((voice_id, model_id))
         for _word in text.split():
             await asyncio.sleep(self.chunk_delay)
             yield bytes(sample_rate * 2 // 10)
@@ -117,9 +121,11 @@ def make_settings(**overrides) -> Settings:
         elevenlabs_api_key="e",
         elevenlabs_tts_voice_id="el-voice",
         openrouter_api_key="o",
+        llm_provider="openrouter",
         openrouter_fallback_model="fallback-model",
         database_url="postgresql://x",
         bakbak_api_key="b",
+        deepgram_api_key="dg",
         bakbak_voices={
             "en": {"voice_id": "en-voice", "model_id": "m1"},
             "hi": {"voice_id": "hi-voice", "model_id": "m1"},
@@ -128,6 +134,11 @@ def make_settings(**overrides) -> Settings:
         },
         usd_to_inr=85.0,
         exotel_inr_per_minute=None,
+        # No TTS/ASR fallback by default: tests that exercise a fallback set tts_fallback_provider /
+        # asr_fallback_provider explicitly, so a test that only picks a primary provider never risks an
+        # accidental TTS_PROVIDER == TTS_FALLBACK_PROVIDER collision.
+        tts_fallback_provider=None,
+        asr_fallback_provider=None,
     )
     return Settings(_env_file=None, **(base | overrides))
 

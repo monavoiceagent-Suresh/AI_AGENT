@@ -1,14 +1,14 @@
 # Voice Agent Platform
 
 AI telecalling over Exotel. A caller's audio streams over Exotel's Voicebot WebSocket to this FastAPI service, which runs
-**ElevenLabs Scribe Realtime** (ASR) → **OpenRouter** (LLM, with an automatic **Groq** fallback) → **Bakbak (Raya) streaming TTS** and plays the reply back,
+**ElevenLabs Scribe Realtime** (ASR) → **OpenRouter or Groq** (LLM, chosen by `LLM_PROVIDER`, the other as the automatic fallback) → **Bakbak (Raya) streaming TTS** and plays the reply back,
 with barge-in. Agents, calls, turns, outcomes, latency and cost estimates are stored in PostgreSQL.
 
 There is no frontend. Agents and calls are managed through a bearer-protected JSON API; interactive docs are at `/docs`
 (click *Authorize* and paste `APP_SECRET_KEY`).
 
 ```
-Exotel ──wss──▶ /exotel/stream ─▶ VoiceSession ─▶ Scribe (ASR) ─▶ OpenRouter / Groq (LLM) ─▶ Bakbak (TTS) ─┐
+Exotel ──wss──▶ /exotel/stream ─▶ VoiceSession ─▶ Scribe (ASR) ─▶ OpenRouter or Groq (LLM) ─▶ Bakbak (TTS) ─┐
    ▲                                  │ persist (PostgreSQL)                                              │
    └────────────── media / mark / clear ◀───────────────────────────────────────────────────────────────┘
 ```
@@ -49,36 +49,55 @@ curl -X POST localhost:8000/agents -H "$AUTH" -H 'Content-Type: application/json
   outbound calls, the `contact_name` passed to `POST /calls`) and `[[CURRENT_DATETIME]]` (India time). They are
   filled in for every call; with `[[KNOWLEDGE]]` present the knowledge is inlined instead of appended.
 - Optional per-agent `voice_id`, `tts_model_id`, `llm_model` override the `.env` defaults (`llm_model` replaces
-  `OPENROUTER_MODEL`; the fallback always uses `GROQ_MODEL`).
+  the primary provider's model, `OPENROUTER_MODEL` or `GROQ_MODEL`; the fallback uses its own).
 - The voice comes from `BAKBAK_VOICES` by language (see *Text-to-speech* below). `voice_id` and `tts_model_id`
   override it, but must be set together because a Bakbak voice belongs to exactly one model.
 - Exactly one agent can have `is_inbound_default: true`; it answers inbound calls.
 
 ## Language model (LLM)
 
-The primary LLM is **OpenRouter** (`OPENROUTER_MODEL`); **Groq** (`openai/gpt-oss-20b`) is the automatic fallback.
-With no `GROQ_API_KEY`, OpenRouter answers every request and its errors are raised as they are. Both are called
-through the same OpenAI-compatible streaming adapter (`app/providers/chat_completions.py`);
-`app/providers/failover.py` chooses.
+`LLM_PROVIDER` chooses which LLM answers first: `LLM_PROVIDER=GROQ` (Groq primary, OpenRouter fallback) or
+`LLM_PROVIDER=OPENROUTER` (OpenRouter primary, Groq fallback). Any letter case works; the default is `openrouter`.
+The other provider is the automatic fallback when its key is set; without it the primary answers alone and its errors
+are raised as they are. The primary's key must be set or the engine refuses to start. Both are called through the same
+OpenAI-compatible streaming adapter (`app/providers/chat_completions.py`); `app/providers/failover.py` chooses.
 
-- **Primary:** `POST {OPENROUTER_BASE_URL}/chat/completions` (default `https://openrouter.ai/api/v1`) with
+- **OpenRouter:** `POST {OPENROUTER_BASE_URL}/chat/completions` (default `https://openrouter.ai/api/v1`) with
   `Authorization: Bearer $OPENROUTER_API_KEY`, model `OPENROUTER_MODEL`. `OPENROUTER_FALLBACK_MODEL`, the name this
-  setting had when OpenRouter was the fallback, is still read.
-- **Fallback:** `POST {GROQ_BASE_URL}/chat/completions` (default `https://api.groq.com/openai/v1`) with
+  setting had when OpenRouter was always the fallback, is still read.
+- **Groq:** `POST {GROQ_BASE_URL}/chat/completions` (default `https://api.groq.com/openai/v1`) with
   `Authorization: Bearer $GROQ_API_KEY`, model `GROQ_MODEL` (default `openai/gpt-oss-20b`).
+- **Models:** each provider is asked for its own model. An agent's `llm_model` goes to the primary only.
 - **Reasoning:** gpt-oss streams its thinking in a separate reasoning field before the answer in `delta.content`. Only
   the answer is spoken. Thinking tokens count against `GROQ_MAX_OUTPUT_TOKENS`, which is why it defaults to 1024.
-- **When it falls back:** the primary times out (`OPENROUTER_TIMEOUT_MS`, default 4000), cannot connect, answers 429,
-  or answers 5xx. Timeouts, connection errors and 5xx are retried `OPENROUTER_MAX_RETRIES` times first (default 0,
-  because every retry adds a full timeout before the fallback starts); a 429 never retries. The fallback has
-  `GROQ_TIMEOUT_MS` (8000) and `GROQ_MAX_RETRIES` (1), since nothing follows it. Client errors (401 bad key, 404 unknown model) are **not** failed over, so misconfiguration stays visible.
+- **When it falls back:** the primary times out, cannot connect, answers 429, or answers 5xx. Timeouts, connection
+  errors and 5xx are retried first, waiting with exponential backoff and jitter between attempts
+  (`LLM_RETRY_BACKOFF_BASE_MS`/`LLM_RETRY_BACKOFF_MAX_MS`, default 300–2000 ms); a 429 never retries inline — it goes
+  straight to the fallback. By role, the primary defaults to a 4000 ms timeout and no retry (every retry adds a full
+  timeout before the fallback starts) and the fallback to 8000 ms and one retry, since nothing follows it.
+  `OPENROUTER_TIMEOUT_MS`, `OPENROUTER_MAX_RETRIES`, `GROQ_TIMEOUT_MS` and `GROQ_MAX_RETRIES` override this for that
+  provider. Client errors (401 bad key, 404 unknown model) are **not** failed over, so misconfiguration stays visible.
+- **Request-rate safety limits** (`app/providers/rate_limit.py`, `app/providers/budget.py`): each provider
+  self-throttles to `OPENROUTER_MAX_REQUESTS_PER_MINUTE` / `GROQ_MAX_REQUESTS_PER_MINUTE` (default 18/60, shared by
+  every concurrent call) — once reached, the next request fails fast with no HTTP call at all and the fallback
+  answers instead. A 429 also opens a short cooldown (honouring `Retry-After` if the provider sends one; 1 s
+  otherwise) so a just-limited provider is not asked again immediately. Separately, each phone call gets its own
+  budget of at most `LLM_MAX_REQUESTS_PER_CALL` requests (default 40, counting both conversation turns and the
+  post-call outcome extraction) so a stuck call can never make an unbounded number of requests. These are independent
+  of each other and of the per-attempt retry above.
 - **No replay:** the fallback is used only if the primary failed *before any text was produced*. If it fails after
   speaking has started, the call keeps what the caller already heard and the agent says its short apology instead.
 - **Both fail:** the agent speaks the apology phrase and the caller's words are kept for the next turn.
-- **Post-call outcome extraction** uses the same primary-then-fallback order.
-- **Logs** name the failure (for example `LLMError 503`) but never its message, prompts or credentials.
-- **Cost:** OpenRouter reports a `cost` in each response and it is recorded as USD; Groq reports none, so a turn
-  answered by the fallback records 0.
+  `MAX_CONSECUTIVE_LLM_FAILURES` (default 3) ends the call instead of apologising forever if responses keep failing
+  one after another; any response that succeeds resets the count.
+- **Duplicate utterances:** a committed transcript identical to the one just answered, delivered again within
+  `LLM_DEDUP_WINDOW_MS` (default 700 ms — an ASR/websocket retransmit, not a caller repeating themselves), is dropped
+  instead of being answered a second time. Partial transcripts, silence and the greeting never call the LLM at all.
+- **Post-call outcome extraction** uses the same primary-then-fallback order and shares the call's request budget.
+- **Logs** one line per request attempt (provider, model, a short request id, attempt number, status, latency) and
+  name failures (for example `LLMError 503`) but never log the message content, a response body or credentials.
+- **Cost:** OpenRouter reports a `cost` in each response and it is recorded as USD; Groq reports none, so a Groq-
+  answered turn records 0.
 - The engine does not execute tools, so no tool definitions are sent and a fallback can never repeat a tool call.
 
 ## Text-to-speech
@@ -94,11 +113,17 @@ so no further audio is received.
   availability, not listening. English agents use Bakbak's `en-in` (Indian English).
 - **Text:** Bakbak wants Hindi in Devanagari, and says Indian names inside English sound better written in
   Devanagari. The agent prompt already asks for native script, so this only matters for English agents.
-- **ElevenLabs fallback (optional):** `TTS_FALLBACK_ENABLED=true` retries a sentence on ElevenLabs if Bakbak fails
+- **Fallback (optional):** `TTS_FALLBACK_ENABLED=true` retries a sentence on the *other* provider if the primary fails (Bakbak primary: ElevenLabs takes over; ElevenLabs primary: Bakbak takes over with the voice for the agent's language), but only
   *before any audio was produced* (never mid-sentence, which would repeat words). Characters are metered per
   provider. Set `TTS_PROVIDER=elevenlabs` to switch fully; Telugu there needs `"tts_model_id": "eleven_v3"`.
 - **Cost:** Bakbak publishes no price. Set `BAKBAK_INR_PER_1K_CHARS` to your contracted rate; until then
   `cost.tts` is `null` and `cost.complete` is `false` rather than guessed.
+- **`GET /voices`** (admin) proxies whichever provider `TTS_PROVIDER` names and returns its real voices right
+  now — never a hardcoded list. The dashboard's voice picker calls this instead of offering fixed labels.
+- **A campaign's or test call's own voice**: `POST /campaigns/dispatch` and `POST /calls/test` accept an optional
+  `voiceId`/`ttsModelId` (both or neither, like an agent's own `voice_id`/`tts_model_id`), checked against the
+  configured provider exactly like an agent's. When given, it overrides the agent's current voice for that
+  persona from then on; when omitted, the agent keeps whatever voice it already had.
 
 ## Exotel setup (manual, in the Exotel dashboard)
 

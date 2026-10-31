@@ -148,3 +148,37 @@ def test_parse_outcome():
     assert prompts.parse_outcome(a, raw) == ("qualified", {"name": "Ravi", "budget": "50 lakh"}, "Keen buyer.")
     assert prompts.parse_outcome(a, '{"outcome": "booked"}')[0] == "extraction_failed"
     assert prompts.parse_outcome(a, "no json")[0] == "extraction_failed"
+
+
+def outcome_rules_agent(**overrides) -> Agent:
+    rules = [
+        {"name": "Interested", "definition": "The contact expresses a clear positive response."},
+        {"name": "Not interested", "definition": "The contact clearly declines."},
+    ]
+    return agent(outcome_rules=rules, outcome_fallback="No clear decision was made.", **overrides)
+
+
+def test_a_persona_with_custom_outcome_rules_is_classified_into_them_not_the_workflow_list():
+    a = outcome_rules_agent()
+    assert prompts.parse_outcome(a, '{"outcome": "Interested", "summary": "Keen."}')[0] == "Interested"
+    assert prompts.parse_outcome(a, '{"outcome": "Inconclusive", "summary": "Unclear."}')[0] == "Inconclusive"
+    # A fixed-workflow word that is not one of the persona's own rules no longer passes.
+    assert prompts.parse_outcome(a, '{"outcome": "qualified", "summary": "x"}')[0] == "extraction_failed"
+
+
+def test_custom_outcome_rules_appear_in_the_prompt_with_their_definitions_and_the_fallback():
+    a = outcome_rules_agent()
+    content = prompts.outcome_messages(a, [("Caller", "hi"), ("Agent", "hello")])[1]["content"]
+    assert "The contact expresses a clear positive response." in content
+    assert "The contact clearly declines." in content
+    assert "No clear decision was made." in content
+    assert '"outcome": "Interested | Not interested | Inconclusive"' in content
+    assert "Call goal:" not in content  # the fixed per-workflow goal is replaced, not just appended
+
+
+def test_without_custom_rules_the_fixed_per_workflow_list_is_used_exactly_as_before():
+    a = agent()
+    assert a.outcome_rules == [] and a.outcome_fallback is None
+    content = prompts.outcome_messages(a, [("Caller", "hi")])[1]["content"]
+    assert "Call goal:" in content
+    assert prompts.parse_outcome(a, '{"outcome": "qualified", "summary": "x"}')[0] == "qualified"

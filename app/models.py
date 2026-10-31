@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
+from app.config import ASRProvider, TTSProvider
 from app.phone import indian_number_problem
 
 Language = Literal["en", "hi", "ta", "te"]
@@ -22,6 +23,15 @@ TTS_MODEL_LANGUAGES: dict[str, set[str]] = {
 BAKBAK_MODELS = {"standard", "m1"}
 
 
+class OutcomeRuleIn(BaseModel):
+    """One named outcome in a persona's own classification vocabulary (the dashboard's Call Outcome
+    Rules page). When a persona has any of these, outcome extraction classifies into these names
+    instead of the fixed per-workflow list, so the dashboard's own wording comes back directly."""
+
+    name: str = Field(min_length=2, max_length=60)
+    definition: str = Field(min_length=1, max_length=600, description="When this outcome applies.")
+
+
 class AgentIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     language: Language
@@ -32,6 +42,16 @@ class AgentIn(BaseModel):
     collect_fields: list[str] = Field(
         default_factory=list,
         description="Details to gather (lead qualification / appointment), e.g. name, budget.",
+    )
+    outcome_rules: list[OutcomeRuleIn] = Field(
+        default_factory=list,
+        max_length=10,
+        description="Custom outcome vocabulary; empty uses the fixed per-workflow list instead.",
+    )
+    outcome_fallback: str | None = Field(
+        None,
+        max_length=600,
+        description="Definition for 'Inconclusive', the always-last catch-all. Required if outcome_rules is set.",
     )
     voice_id: str | None = Field(
         None, description="Overrides the language's default voice. With Bakbak, set together with tts_model_id."
@@ -44,6 +64,14 @@ class AgentIn(BaseModel):
         description=(
             "Overrides the primary model (OPENROUTER_MODEL) for this agent. The fallback always uses GROQ_MODEL."
         ),
+    )
+    asr_provider: ASRProvider | None = Field(None, description="Overrides ASR_PROVIDER for this agent.")
+    asr_fallback_provider: ASRProvider | None = Field(
+        None, description="Overrides ASR_FALLBACK_PROVIDER for this agent."
+    )
+    tts_provider: TTSProvider | None = Field(None, description="Overrides TTS_PROVIDER for this agent.")
+    tts_fallback_provider: TTSProvider | None = Field(
+        None, description="Overrides TTS_FALLBACK_PROVIDER for this agent."
     )
     is_inbound_default: bool = Field(False, description="Answer inbound calls with this agent.")
     client_id: str | None = Field(
@@ -64,6 +92,25 @@ class AgentIn(BaseModel):
                 "an agent that belongs to a workspace cannot be the engine-wide inbound default; "
                 "publish an inbound route for the number from the dashboard to choose its persona"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_outcome_rules(self) -> Self:
+        if self.outcome_rules and not self.outcome_fallback:
+            raise ValueError("outcome_fallback is required when outcome_rules is set")
+        names = [r.name.strip().lower() for r in self.outcome_rules]
+        if len(names) != len(set(names)):
+            raise ValueError("outcome_rules names must be unique")
+        if "inconclusive" in names:
+            raise ValueError("'Inconclusive' is the always-last fallback; it cannot be a named rule")
+        return self
+
+    @model_validator(mode="after")
+    def _check_provider_overrides(self) -> Self:
+        if self.asr_provider is not None and self.asr_provider == self.asr_fallback_provider:
+            raise ValueError("asr_fallback_provider must differ from asr_provider")
+        if self.tts_provider is not None and self.tts_provider == self.tts_fallback_provider:
+            raise ValueError("tts_fallback_provider must differ from tts_provider")
         return self
 
 
@@ -137,9 +184,61 @@ class PersonaIn(_Camel):
     greeting: str = Field(min_length=1)
     knowledge: str = ""
     version: int = Field(ge=1)
+    # The workspace's own Call Outcome Rules, current when this was sent. Empty means the engine
+    # classifies into its own fixed per-workflow list, exactly as before these fields existed.
+    outcome_rules: list[OutcomeRuleIn] = Field(default_factory=list, max_length=10)
+    outcome_fallback: str | None = Field(None, max_length=600)
+    # The dashboard's own resolved Persona -> Workspace -> Global provider choice. Omitted/null at every
+    # level means the engine's own global default (Settings) is used, exactly as before these fields existed.
+    asr_provider: ASRProvider | None = None
+    asr_fallback_provider: ASRProvider | None = None
+    tts_provider: TTSProvider | None = None
+    tts_fallback_provider: TTSProvider | None = None
+
+    @model_validator(mode="after")
+    def _check_outcome_rules(self) -> Self:
+        if self.outcome_rules and not self.outcome_fallback:
+            raise ValueError("outcomeFallback is required when outcomeRules is set")
+        names = [r.name.strip().lower() for r in self.outcome_rules]
+        if len(names) != len(set(names)):
+            raise ValueError("outcomeRules names must be unique")
+        if "inconclusive" in names:
+            raise ValueError("'Inconclusive' is the always-last fallback; it cannot be a named rule")
+        return self
+
+    @model_validator(mode="after")
+    def _check_provider_overrides(self) -> Self:
+        if self.asr_provider is not None and self.asr_provider == self.asr_fallback_provider:
+            raise ValueError("asrFallbackProvider must differ from asrProvider")
+        if self.tts_provider is not None and self.tts_provider == self.tts_fallback_provider:
+            raise ValueError("ttsFallbackProvider must differ from ttsProvider")
+        return self
 
 
-class DispatchIn(_Camel):
+class VoiceChoice(_Camel):
+    """A campaign's (or test call's) own voice choice, from the real voices GET /voices lists. Overrides
+    whatever the agent for this persona already has; set both or neither, like AgentIn's voice_id/tts_model_id."""
+
+    voice_id: str | None = Field(None, min_length=1)
+    tts_model_id: str | None = Field(None, min_length=1)
+
+
+class TestCallIn(VoiceChoice):
+    """One real outbound call, placed immediately: no campaign, no job, no webhook report. Used by the
+    dashboard's "test outbound call" control, which has a persona but no stored engine agent to call with."""
+
+    client_id: str = Field(min_length=1, max_length=64)
+    persona: PersonaIn
+    to: str = Field(pattern=r"^\+?[0-9]{10,15}$", description="Number to dial, e.g. +919876543210.")
+    contact_name: str | None = Field(None, max_length=100)
+
+    @field_validator("contact_name")
+    @classmethod
+    def _single_line(cls, value: str | None) -> str | None:
+        return " ".join(value.split()) or None if value else None
+
+
+class DispatchIn(VoiceChoice):
     idempotency_key: str = Field(min_length=8, max_length=100)
     campaign_id: str = Field(min_length=1, max_length=64)
     client_id: str = Field(min_length=1, max_length=64)
@@ -208,6 +307,21 @@ class DispatchOut(_Camel):
     engine_job_id: str | None
     status: Literal["accepted", "rejected"]
     reason: str | None = None
+
+
+class VoiceOption(_Camel):
+    """One voice the configured TTS provider actually has, as it reported it. Never hardcoded."""
+
+    voice_id: str
+    name: str
+    language: str | None = None
+    # Bakbak only: a voice belongs to exactly one model (standard/m1); ElevenLabs voices are model-independent.
+    model_id: str | None = None
+
+
+class VoicesOut(_Camel):
+    provider: Literal["bakbak", "elevenlabs", "deepgram"]
+    voices: list[VoiceOption]
 
 
 JobStatus = Literal["queued", "running", "completed", "cancelled"]

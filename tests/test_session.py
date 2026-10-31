@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from app.interfaces import CallAudio, TTSError, Voice
+from app.interfaces import CallAudio, CommittedTranscript, LLMUsage, TTSError, Voice
 from app.session import SentenceSplitter, SessionConfig, VoiceSession
 from tests.fakes import FakeASR, FakeLLM, FakeMedia, FakeTTS
 
@@ -155,8 +155,102 @@ async def test_idle_caller_ends_the_call():
 
 class FailingLLM(FakeLLM):
     async def stream(self, messages, model):
+        self.requests.append(messages)
         raise RuntimeError("upstream 429")
         yield  # pragma: no cover - makes this an async generator
+
+
+async def test_a_redelivered_committed_transcript_is_not_answered_twice():
+    """A websocket/ASR retransmit of the same committed utterance must not cost a second LLM request."""
+    llm = FakeLLM(["We open at nine."])
+    session, media, asr = make_session(llm, llm_dedup_window_ms=5000)
+    task = asyncio.create_task(session.run())
+    await wait_for(lambda: len(session.turns) == 1)
+    asr.say("When do you open?")
+    await wait_for(lambda: len(session.turns) == 2)
+    asr.queue.put_nowait(CommittedTranscript("When do you open?"))  # the exact same event, redelivered
+    await asyncio.sleep(0.05)
+    media.hang_up()
+    await task
+
+    assert len(session.turns) == 2  # the redelivery did not create a third turn
+    assert len(llm.requests) == 1  # and never reached the LLM
+
+
+async def test_an_unrelated_committed_transcript_within_the_dedup_window_still_answers():
+    """The dedup window only drops an exact repeat; a genuinely different utterance is always answered."""
+    llm = FakeLLM(["We open at nine.", "We're open till six."])
+    session, media, asr = make_session(llm, llm_dedup_window_ms=5000)
+    task = asyncio.create_task(session.run())
+    await wait_for(lambda: len(session.turns) == 1)
+    asr.say("When do you open?")
+    await wait_for(lambda: len(session.turns) == 2)
+    asr.say("When do you close?")
+    await wait_for(lambda: len(session.turns) == 3)
+    media.hang_up()
+    await task
+
+    assert len(llm.requests) == 2
+    assert session.turns[2]["agent_text"] == "We're open till six."
+
+
+async def test_the_call_ends_after_too_many_consecutive_failed_responses():
+    """Repeated failures end the call instead of apologising forever, and each one still counts toward
+    its own call's LLM request budget via the FailingLLM.requests it appends to."""
+    llm = FailingLLM([])
+    session, media, asr = make_session(llm, max_consecutive_llm_failures=2)
+    task = asyncio.create_task(session.run())
+    await wait_for(lambda: len(session.turns) == 1)
+
+    asr.say("Hello?")
+    await wait_for(lambda: len(session.turns) == 2)
+    asr.say("Hello? Anyone there?")
+
+    end_reason = await asyncio.wait_for(task, 5)
+
+    assert end_reason == "agent_ended"  # the agent hung up itself instead of trying forever
+    assert len(llm.requests) == 2  # exactly the configured limit of attempts, not an unbounded number
+    assert session.turns[-1]["agent_text"] == "Sorry, say that again?"
+
+
+class FlakyLLM(FakeLLM):
+    """Fails on the given 1-based attempt numbers, replies normally otherwise."""
+
+    def __init__(self, fail_on: set[int], replies: list[str]) -> None:
+        super().__init__(replies)
+        self.fail_on = fail_on
+        self.attempt = 0
+
+    async def stream(self, messages: list[dict[str, str]], model: str):
+        self.attempt += 1
+        self.requests.append(messages)
+        if self.attempt in self.fail_on:
+            raise RuntimeError("flaky")
+        for word in self.replies.pop(0).split(" "):
+            yield word + " "
+        yield LLMUsage(prompt_tokens=1, completion_tokens=1, cost_usd=0.0)
+
+
+async def test_a_successful_response_resets_the_consecutive_failure_count():
+    """Fails, then succeeds, then fails again: never two failures in a row, so the call must survive
+    both failures instead of being ended by the consecutive-failure guard."""
+    llm = FlakyLLM(fail_on={1, 3}, replies=["We're open."])
+    session, media, asr = make_session(llm, max_consecutive_llm_failures=2)
+    task = asyncio.create_task(session.run())
+    await wait_for(lambda: len(session.turns) == 1)
+
+    asr.say("Hi")  # attempt 1: fails
+    await wait_for(lambda: len(session.turns) == 2)
+    asr.say("When do you open?")  # attempt 2: succeeds, resetting the counter
+    await wait_for(lambda: len(session.turns) == 3)
+    asr.say("And tomorrow?")  # attempt 3: fails again, but it's the first failure since the reset
+    await wait_for(lambda: len(session.turns) == 4)
+    media.hang_up()
+
+    assert await task == "caller:callended"  # ended by the hangup, not by the failure guard
+    assert session.turns[1]["agent_text"] == "Sorry, say that again?"
+    assert session.turns[2]["agent_text"] == "We're open."
+    assert session.turns[3]["agent_text"] == "Sorry, say that again?"
 
 
 async def test_llm_failure_apologises_to_the_caller():

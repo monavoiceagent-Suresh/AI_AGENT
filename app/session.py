@@ -70,6 +70,11 @@ class SessionConfig:
     idle_timeout_seconds: float
     max_duration_seconds: float
     log_transcripts: bool
+    # A committed transcript identical to the one just answered, delivered again within this window, is a
+    # redelivery (ASR/websocket retransmit), not a new turn: 0 disables the check.
+    llm_dedup_window_ms: int = 0
+    # Ends the call instead of trying forever once this many responses in a row have failed.
+    max_consecutive_llm_failures: int = 3
 
 
 @dataclass
@@ -93,6 +98,10 @@ def _ms(seconds: float) -> int:
 
 def _join(*parts: str) -> str:
     return " ".join(p for p in parts if p).strip()
+
+
+def _normalize(text: str) -> str:
+    return " ".join(text.lower().split())
 
 
 class VoiceSession:
@@ -125,6 +134,11 @@ class VoiceSession:
         self._last_partial_at: float | None = None
         self._last_activity = time.monotonic()
         self._hangup = asyncio.Event()
+        # Guards against the LLM call paths this module controls: a redelivered commit of the same utterance,
+        # and a run of failed responses that would otherwise keep retrying for the rest of the call.
+        self._last_dispatched_text = ""
+        self._last_dispatched_at = 0.0
+        self._consecutive_llm_failures = 0
 
     @property
     def asr_seconds(self) -> float:
@@ -213,6 +227,9 @@ class VoiceSession:
         self._last_activity = now
         if self.config.log_transcripts:
             log.info("caller: %s", text)
+        if self._is_duplicate_redelivery(text, now):
+            log.info("dropped a committed transcript identical to the one just answered (redelivery)")
+            return
         endpointing_ms = _ms(now - self._last_partial_at) if self._last_partial_at else None
         self._last_partial_at = None
         self._pending_user = _join(self._pending_user, text)
@@ -222,6 +239,18 @@ class VoiceSession:
             await self._cancel_response()
             await self.media.clear()
         self._start_response(user_text=self._pending_user, committed_at=now, endpointing_ms=endpointing_ms)
+
+    def _is_duplicate_redelivery(self, text: str, now: float) -> bool:
+        """Whether `text` is exactly the utterance just dispatched, delivered again moments later.
+
+        Compares only the single incoming fragment against the last whole dispatch, so it can suppress a
+        resent duplicate but never a genuinely new utterance: a new one essentially never normalizes to be
+        byte-identical to everything that was just answered.
+        """
+        window = self.config.llm_dedup_window_ms / 1000
+        if not window or _normalize(text) != self._last_dispatched_text:
+            return False
+        return now - self._last_dispatched_at < window
 
     # ---- responses ----------------------------------------------------------------------
 
@@ -233,6 +262,9 @@ class VoiceSession:
         self._next_response_id += 1
         self._response = _Response(self._next_response_id, user_text, committed_at, endpointing_ms)
         self._response_task = asyncio.create_task(self._respond(self._response))
+        if user_text:
+            self._last_dispatched_text = _normalize(user_text)
+            self._last_dispatched_at = committed_at
 
     async def _cancel_response(self) -> None:
         """Stop the in-flight response and keep only what the caller actually heard."""
@@ -267,10 +299,15 @@ class VoiceSession:
             log.exception("response %s failed", response.id)
             spoken = await self._apologise(response)
             self._finish_turn(response, interrupted=not spoken)
+            self._consecutive_llm_failures += 1
+            if self._consecutive_llm_failures >= self.config.max_consecutive_llm_failures:
+                log.warning("ending call after %d consecutive failed responses", self._consecutive_llm_failures)
+                self._hangup.set()
             return
         finally:
             if producer is not None:
                 producer.cancel()
+        self._consecutive_llm_failures = 0
         self._finish_turn(response, interrupted=False)
         self._last_activity = time.monotonic()
         if response.end_call:

@@ -49,7 +49,11 @@ async def accept(svc: Services, request: DispatchIn) -> DispatchOut:
     if not svc.settings.enable_outbound_calls:
         return _rejected("Outbound calls are disabled on the voice engine (ENABLE_OUTBOUND_CALLS=false)")
     persona = request.persona
-    speakable = AgentIn(**persona.model_dump(include=set(dispatch_db.PERSONA_FIELDS)))
+    speakable = AgentIn(
+        **persona.model_dump(include=set(dispatch_db.PERSONA_FIELDS)),
+        voice_id=request.voice_id,
+        tts_model_id=request.tts_model_id,
+    )
     if problem := calls.validate_agent(speakable, svc.settings):
         return _rejected(f"Persona {persona.key!r} cannot be spoken by the voice engine: {problem}")
     try:
@@ -154,7 +158,15 @@ async def place_next_call(svc: Services) -> bool:
     attempt = {**lead, "attempts": lead["attempts"] + 1}
     agent = Agent(**dict(await db.get_agent(svc.pool, lead["agent_id"])))
     try:
-        await calls.place_outbound_call(svc, agent, lead["phone"], lead["name"], lead["lead_pk"])
+        await calls.place_outbound_call(
+            svc,
+            agent,
+            lead["phone"],
+            lead["name"],
+            lead["lead_pk"],
+            voice_id=lead["voice_id"],
+            tts_model_id=lead["tts_model_id"],
+        )
     except CallRejected:
         await dispatch_db.release_lead(svc.pool, lead["lead_pk"])
         return False

@@ -1,10 +1,13 @@
 from functools import lru_cache
 from typing import Literal, Self
 
-from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.interfaces import Voice
+
+TTSProvider = Literal["bakbak", "elevenlabs_premium", "elevenlabs_standard", "deepgram_aura"]
+ASRProvider = Literal["elevenlabs_scribe", "deepgram_nova3"]
 
 
 class Settings(BaseSettings):
@@ -35,43 +38,74 @@ class Settings(BaseSettings):
 
     elevenlabs_api_key: SecretStr
     elevenlabs_asr_model_id: str = "scribe_v2_realtime"
+    # Standard (low-latency) tier model; Telugu is not covered by Flash, only by the Premium tier (eleven_v3).
     elevenlabs_tts_model_id: str = "eleven_flash_v2_5"
-    # Needed only when ElevenLabs is the TTS provider or the fallback.
+    elevenlabs_premium_model_id: str = "eleven_v3"
+    # Needed only when ElevenLabs is a configured TTS provider (primary or fallback, either tier).
     elevenlabs_tts_voice_id: str = ""
     elevenlabs_tts_stability: float = 0.5
     elevenlabs_tts_similarity_boost: float = 0.75
 
-    tts_provider: Literal["bakbak", "elevenlabs"] = "bakbak"
-    # Retry a sentence on ElevenLabs when the primary provider fails before producing audio.
-    tts_fallback_enabled: bool = False
+    deepgram_api_key: SecretStr | None = None
+    # Aura has no Hindi/Tamil/Telugu voices; this must be an "-en" voice (see app/providers/deepgram_tts.py).
+    deepgram_tts_voice: str = "aura-2-thalia-en"
+
+    # Independent primary/fallback choice for ASR and TTS. The fallback is used only when its own credentials
+    # are configured; None disables that fallback entirely. Primary and fallback must differ.
+    asr_provider: ASRProvider = "elevenlabs_scribe"
+    asr_fallback_provider: ASRProvider | None = "deepgram_nova3"
+    tts_provider: TTSProvider = "elevenlabs_premium"
+    tts_fallback_provider: TTSProvider | None = "bakbak"
+
     bakbak_api_key: SecretStr | None = None
     bakbak_base_url: str = "https://hub.getraya.app/v1"
     # Agent language (en, hi, ta, te) -> voice and model. Voice IDs are tied to one model and one language;
     # list them with GET {BAKBAK_BASE_URL}/voices.
     bakbak_voices: dict[str, Voice] = Field(default_factory=dict)
 
-    # Primary LLM: OpenRouter.
-    openrouter_api_key: SecretStr
+    # Which LLM answers first (any letter case). The other one, if its key is set, is the automatic fallback.
+    llm_provider: Literal["openrouter", "groq"] = "openrouter"
+
+    openrouter_api_key: SecretStr | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    # OPENROUTER_FALLBACK_MODEL is the name this setting had when OpenRouter was the fallback; it still works.
-    openrouter_model: str = Field(validation_alias=AliasChoices("openrouter_model", "openrouter_fallback_model"))
+    # OPENROUTER_FALLBACK_MODEL is the name this setting had when OpenRouter was always the fallback; it still works.
+    openrouter_model: str | None = Field(
+        None, validation_alias=AliasChoices("openrouter_model", "openrouter_fallback_model")
+    )
     openrouter_max_output_tokens: int = 250
     openrouter_temperature: float = 0.4
-    # Short on purpose: a slow primary delays the caller's reply, so the fallback should take over quickly.
-    # No retries by default: every retry adds a full timeout before the fallback gets a turn.
-    openrouter_timeout_ms: int = 4000
-    openrouter_max_retries: int = 0
 
-    # Fallback LLM: Groq. Unset means OpenRouter alone answers every request.
     groq_api_key: SecretStr | None = None
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_model: str = "openai/gpt-oss-20b"
     # Reasoning tokens count against this budget, so it must cover the thinking plus the spoken reply.
     groq_max_output_tokens: int = 1024
     groq_temperature: float = 0.4
-    # Nothing follows the fallback, so it gets more time and one retry.
-    groq_timeout_ms: int = 8000
-    groq_max_retries: int = 1
+
+    # Timeout and retries per provider. Unset means the default for its role: a primary gives up quickly (4 s, no
+    # retry, because every retry adds a full timeout before the fallback gets a turn); a fallback has nothing behind
+    # it, so it gets 8 s and one retry.
+    openrouter_timeout_ms: int | None = None
+    openrouter_max_retries: int | None = None
+
+    # Safety limits against excessive LLM requests, shared by whichever provider is primary or fallback.
+    # A provider's per-minute limit is per PROCESS (shared by every concurrent call, so it is a real global cap);
+    # the request limit is per PHONE CALL. Any of these set to 0 or less disables that particular limit.
+    # OpenRouter's own free-tier models cap at 20 requests/minute; 18 leaves headroom before they would 429 us.
+    openrouter_max_requests_per_minute: int = 18
+    groq_max_requests_per_minute: int = 60
+    # A generous backstop against a stuck conversation or a run of failures, not a normal-call limit.
+    llm_max_requests_per_call: int = 40
+    llm_retry_backoff_base_ms: int = 300
+    llm_retry_backoff_max_ms: int = 2000
+    # After this many consecutive failed responses the agent ends the call instead of trying forever.
+    max_consecutive_llm_failures: int = 3
+    # A committed transcript identical to the one just answered, delivered again within this window, is treated
+    # as a duplicate delivery (an ASR/websocket retransmit) and dropped instead of starting a second response.
+    llm_dedup_window_ms: int = 700
+
+    groq_timeout_ms: int | None = None
+    groq_max_retries: int | None = None
 
     database_url: str
     database_pool_min_size: int = 1
@@ -103,10 +137,25 @@ class Settings(BaseSettings):
 
     log_transcripts: bool = False
 
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def _llm_provider_any_case(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _check_llm_provider(self) -> Self:
+        if self.llm_provider == "groq" and self.groq_api_key is None:
+            raise ValueError("LLM_PROVIDER=groq requires GROQ_API_KEY")
+        if self.llm_provider == "openrouter" and self.openrouter_api_key is None:
+            raise ValueError("LLM_PROVIDER=openrouter requires OPENROUTER_API_KEY")
+        if self.openrouter_api_key is not None and not self.openrouter_model:
+            raise ValueError("OPENROUTER_API_KEY is set, so OPENROUTER_MODEL is required too")
+        return self
+
     @property
     def primary_llm_model(self) -> str:
-        """Model used when an agent doesn't set llm_model: the primary provider's (OpenRouter)."""
-        return self.openrouter_model
+        """Model used when an agent doesn't set llm_model: the primary provider's."""
+        return self.groq_model if self.llm_provider == "groq" else self.openrouter_model
 
     # Campaign dispatch from the Mona dashboard. The same value must be the dashboard's
     # VOICE_ENGINE_WEBHOOK_SECRET; without it dispatches are rejected because results could not be reported.
@@ -142,18 +191,63 @@ class Settings(BaseSettings):
         """Inbound calls are reported only when both the destination and the signing secret are configured."""
         return self.dashboard_webhook_url if self.dashboard_webhook_secret is not None else None
 
+    def webhook_configuration_warnings(self) -> list[str]:
+        """Actionable startup warnings for a half-configured or missing dashboard webhook setup.
+
+        Neither half is required to start the engine (a fresh install legitimately has neither yet, and
+        POST /calls and /calls/test need no webhook at all), so these are warnings, not startup errors.
+        """
+        warnings: list[str] = []
+        if self.enable_outbound_calls and self.dashboard_webhook_secret is None:
+            warnings.append(
+                "ENABLE_OUTBOUND_CALLS is true but DASHBOARD_WEBHOOK_SECRET is not set: every campaign "
+                "dispatch will be rejected (POST /calls and /calls/test are unaffected; they need no "
+                "webhook secret). Set DASHBOARD_WEBHOOK_SECRET to the same value as the dashboard's "
+                "VOICE_ENGINE_WEBHOOK_SECRET."
+            )
+        if self.dashboard_webhook_url is not None and self.dashboard_webhook_secret is None:
+            warnings.append(
+                "DASHBOARD_WEBHOOK_URL is set but DASHBOARD_WEBHOOK_SECRET is not: finished inbound calls "
+                "will never be reported to the dashboard (inbound_report_url is None without it)."
+            )
+        if self.dashboard_webhook_secret is not None and self.dashboard_webhook_url is None:
+            warnings.append(
+                "DASHBOARD_WEBHOOK_SECRET is set but DASHBOARD_WEBHOOK_URL is not: finished inbound calls "
+                "will never be reported to the dashboard. Campaign dispatch is unaffected — its webhook "
+                "URL comes from each dispatch request, not from this setting."
+            )
+        return warnings
+
     @model_validator(mode="after")
     def _check_inbound_reserve(self) -> Self:
         if self.inbound_reserved_calls > self.max_concurrent_calls:
             raise ValueError("INBOUND_RESERVED_CALLS cannot exceed MAX_CONCURRENT_CALLS")
         return self
 
+    def tts_credentials_present(self, provider: TTSProvider) -> bool:
+        """Whether the given provider's own credentials are configured, regardless of its role."""
+        if provider == "bakbak":
+            return self.bakbak_api_key is not None and bool(self.bakbak_voices)
+        if provider in ("elevenlabs_premium", "elevenlabs_standard"):
+            return bool(self.elevenlabs_tts_voice_id)
+        return self.deepgram_api_key is not None  # deepgram_aura
+
     @model_validator(mode="after")
     def _check_tts_provider(self) -> Self:
-        if self.tts_provider == "bakbak" and (self.bakbak_api_key is None or not self.bakbak_voices):
-            raise ValueError("TTS_PROVIDER=bakbak requires BAKBAK_API_KEY and BAKBAK_VOICES")
-        if (self.tts_provider == "elevenlabs" or self.tts_fallback_enabled) and not self.elevenlabs_tts_voice_id:
-            raise ValueError("ElevenLabs TTS (primary or fallback) requires ELEVENLABS_TTS_VOICE_ID")
+        # Only the primary must be usable at startup; an unusable fallback is simply not built (see main.py),
+        # exactly like the existing LLM primary/fallback pattern.
+        if self.tts_fallback_provider == self.tts_provider:
+            raise ValueError("TTS_FALLBACK_PROVIDER must differ from TTS_PROVIDER")
+        if not self.tts_credentials_present(self.tts_provider):
+            raise ValueError(f"TTS_PROVIDER={self.tts_provider} is missing its required credentials")
+        return self
+
+    @model_validator(mode="after")
+    def _check_asr_provider(self) -> Self:
+        if self.asr_fallback_provider == self.asr_provider:
+            raise ValueError("ASR_FALLBACK_PROVIDER must differ from ASR_PROVIDER")
+        if self.asr_provider == "deepgram_nova3" and self.deepgram_api_key is None:
+            raise ValueError("ASR_PROVIDER=deepgram_nova3 requires DEEPGRAM_API_KEY")
         return self
 
 

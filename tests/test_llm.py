@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from app.interfaces import LLMUsage
+from app.main import build_llm
 from app.providers.chat_completions import ChatCompletionsLLM, LLMError
 from app.providers.failover import FailoverLLM
 from tests.fakes import make_settings
@@ -273,51 +274,107 @@ async def test_openrouter_request_asks_for_a_stream_with_the_token_budget():
     )
 
 
-async def test_openrouter_is_primary_and_a_timeout_falls_back_to_groqs_endpoint_and_model():
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+def configured(provider: str, handler, **overrides):
+    """The LLM that build_llm makes for LLM_PROVIDER=`provider`, with both keys set unless overridden."""
+    settings = make_settings(llm_provider=provider, openrouter_model="or-model", groq_api_key="groq-key", **overrides)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return build_llm(http, settings), settings
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        (
+            "openrouter",
+            [(OPENROUTER_URL, "Bearer o", "or-model"), (GROQ_URL, "Bearer groq-key", "openai/gpt-oss-20b")],
+        ),
+        (
+            "groq",
+            [(GROQ_URL, "Bearer groq-key", "openai/gpt-oss-20b"), (OPENROUTER_URL, "Bearer o", "or-model")],
+        ),
+    ],
+)
+async def test_llm_provider_decides_which_one_answers_first_and_the_other_is_the_fallback(provider, expected):
     seen = []
+    first_host = httpx.URL(expected[0][0]).host
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append((str(request.url), request.headers["authorization"], json.loads(request.content)["model"]))
-        if request.url.host == "openrouter.ai":
+        if request.url.host == first_host:
             raise httpx.ReadTimeout("no first token in time")
         return ok(delta("Backup."), USAGE)
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    settings = make_settings(openrouter_model="or-model", openrouter_max_retries=0, groq_api_key="groq-key")
-    primary = ChatCompletionsLLM(
-        http,
-        name="OpenRouter",
-        api_key=settings.openrouter_api_key.get_secret_value(),
-        base_url=settings.openrouter_base_url,
-        max_tokens=settings.openrouter_max_output_tokens,
-        temperature=settings.openrouter_temperature,
-        timeout_ms=settings.openrouter_timeout_ms,
-        max_retries=settings.openrouter_max_retries,
-    )
-    fallback = ChatCompletionsLLM(
-        http,
-        name="Groq",
-        api_key=settings.groq_api_key.get_secret_value(),
-        base_url=settings.groq_base_url,
-        max_tokens=settings.groq_max_output_tokens,
-        temperature=settings.groq_temperature,
-        timeout_ms=settings.groq_timeout_ms,
-        max_retries=settings.groq_max_retries,
-    )
-    llm = FailoverLLM(primary=primary, fallback=fallback, fallback_model=settings.groq_model)
+    llm, settings = configured(provider, handler)
 
     text, _ = await stream_text(llm, settings.primary_llm_model)
 
     assert text == "Backup."
-    assert seen == [
-        ("https://openrouter.ai/api/v1/chat/completions", "Bearer o", "or-model"),
-        ("https://api.groq.com/openai/v1/chat/completions", "Bearer groq-key", "openai/gpt-oss-20b"),
-    ]  # one attempt on each provider, and Groq gets its own model, not OpenRouter's
+    # One attempt on each provider, and each provider is asked for its own model, never the other's.
+    assert seen == expected
 
 
-def test_the_primary_model_is_openrouters_and_the_old_setting_name_still_works():
-    # make_settings sets it through openrouter_fallback_model, the name it had when OpenRouter was the fallback.
+@pytest.mark.parametrize("value", ["GROQ", "Groq", " groq "])
+def test_groq_can_be_written_in_any_case(value):
+    settings = make_settings(llm_provider=value, groq_api_key="g")
+    assert settings.llm_provider == "groq" and settings.primary_llm_model == "openai/gpt-oss-20b"
+
+
+@pytest.mark.parametrize("value", ["OPENROUTER", "OpenRouter", " openrouter "])
+def test_openrouter_can_be_written_in_any_case(value):
+    settings = make_settings(llm_provider=value, openrouter_model="or-model")
+    assert settings.llm_provider == "openrouter" and settings.primary_llm_model == "or-model"
+
+
+def test_a_missing_key_for_the_chosen_primary_is_a_startup_error():
+    with pytest.raises(ValueError, match="LLM_PROVIDER=groq requires GROQ_API_KEY"):
+        make_settings(llm_provider="groq", groq_api_key=None)
+    with pytest.raises(ValueError, match="LLM_PROVIDER=openrouter requires OPENROUTER_API_KEY"):
+        make_settings(llm_provider="openrouter", openrouter_api_key=None)
+    with pytest.raises(ValueError, match="OPENROUTER_MODEL"):
+        make_settings(llm_provider="groq", groq_api_key="g", openrouter_model="")
+    with pytest.raises(ValueError):
+        make_settings(llm_provider="gemini")
+
+
+@pytest.mark.parametrize(
+    ("provider", "other_key", "only_url"),
+    [("groq", {"openrouter_api_key": None}, GROQ_URL), ("openrouter", {"groq_api_key": None}, OPENROUTER_URL)],
+)
+async def test_the_other_provider_is_optional_without_it_there_is_no_fallback(provider, other_key, only_url):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return fail(503)
+
+    settings = make_settings(llm_provider=provider, openrouter_model="or-model", **{"groq_api_key": "g", **other_key})
+    llm = build_llm(httpx.AsyncClient(transport=httpx.MockTransport(handler)), settings)
+
+    with pytest.raises(LLMError) as exc:
+        await stream_text(llm)
+
+    assert exc.value.status == 503
+    assert seen == [only_url]  # the primary's own error, and nothing else was tried
+
+
+@pytest.mark.parametrize(("provider", "primary_name"), [("openrouter", "OpenRouter"), ("groq", "Groq")])
+def test_timeouts_default_by_role_and_an_explicit_setting_wins(provider, primary_name):
+    llm, _ = configured(provider, lambda request: fail(500))
+
+    assert llm._primary._name == primary_name
+    assert (llm._primary._timeout, llm._primary._max_retries) == (4.0, 0)  # gives up quickly
+    assert (llm._fallback._timeout, llm._fallback._max_retries) == (8.0, 1)  # nothing is behind it
+
+    llm, _ = configured(provider, lambda request: fail(500), groq_timeout_ms=1234, groq_max_retries=0)
+    groq_client = llm._primary if provider == "groq" else llm._fallback
+    assert (groq_client._timeout, groq_client._max_retries) == (1.234, 0)
+
+
+def test_the_old_openrouter_fallback_model_name_still_sets_the_model():
+    # make_settings uses openrouter_fallback_model, the name this setting had when OpenRouter was always the fallback.
     assert make_settings().primary_llm_model == "fallback-model"
     assert make_settings(openrouter_model="or-model").primary_llm_model == "or-model"
-    assert make_settings(groq_api_key="g").primary_llm_model == make_settings(groq_api_key=None).primary_llm_model
-    assert make_settings(groq_api_key=None).groq_api_key is None  # Groq is an optional fallback

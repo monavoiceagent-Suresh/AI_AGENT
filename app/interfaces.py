@@ -1,6 +1,7 @@
 """Contracts between the voice-session orchestrator and the provider adapters."""
 
 from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -59,6 +60,11 @@ class Transcriber(Protocol):
     async def send_audio(self, pcm: bytes) -> None: ...
 
     def events(self) -> AsyncIterator[PartialTranscript | CommittedTranscript]: ...
+
+
+class ASR(Protocol):
+    def connect(self, *, language: str, sample_rate: int) -> AbstractAsyncContextManager[Transcriber]:
+        """One streaming session for one call."""
 
 
 @dataclass(frozen=True)

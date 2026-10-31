@@ -11,7 +11,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app import calls, db, dispatch, dispatch_db, inbound, inbound_db
+from app import calls, db, dispatch, dispatch_db, inbound, inbound_db, voices
 from app.calls import CallRejected, Services
 from app.models import (
     Agent,
@@ -26,7 +26,9 @@ from app.models import (
     InboundRoutePublishIn,
     JobOut,
     OutboundCallIn,
+    TestCallIn,
     UnroutedOut,
+    VoicesOut,
 )
 from app.providers.exotel import ExotelError, ExotelMediaStream
 from app.redaction import redact
@@ -77,6 +79,15 @@ async def create_agent(agent: AgentIn, svc: Svc) -> Agent:
         return Agent(**dict(await db.create_agent(svc.pool, _checked(agent, svc))))
     except asyncpg.UniqueViolationError as exc:
         raise HTTPException(409, PERSONA_TAKEN) from exc
+
+
+@admin.get("/voices")
+async def list_voices(svc: Svc) -> VoicesOut:
+    """The real voices the configured TTS provider has right now, for the dashboard's voice picker."""
+    try:
+        return await voices.list_voices(svc.http, svc.settings)
+    except voices.VoicesUnavailable as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @admin.get("/agents")
@@ -192,6 +203,32 @@ async def place_call(body: OutboundCallIn, svc: Svc) -> CallDetail:
     return await get_call(call_id, svc)
 
 
+@admin.post("/calls/test", status_code=201)
+async def place_test_call(body: TestCallIn, svc: Svc) -> CallDetail:
+    """Places one call right away from a persona snapshot instead of a stored agent_id: for the dashboard's
+    "test outbound call" control, which has no campaign or published route to have created an agent yet."""
+    persona = body.persona
+    speakable = AgentIn(
+        **persona.model_dump(include=set(dispatch_db.PERSONA_FIELDS)),
+        voice_id=body.voice_id,
+        tts_model_id=body.tts_model_id,
+    )
+    if problem := calls.validate_agent(speakable, svc.settings):
+        raise HTTPException(422, f"Persona {persona.key!r} cannot be spoken by the voice engine: {problem}")
+    async with svc.pool.acquire() as conn:
+        agent_id = await dispatch_db.upsert_persona_agent(conn, body.client_id, persona)
+    agent = Agent(**dict(await db.get_agent(svc.pool, agent_id)))
+    try:
+        call_id = await calls.place_outbound_call(
+            svc, agent, body.to, body.contact_name, voice_id=body.voice_id, tts_model_id=body.tts_model_id
+        )
+    except CallRejected as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ExotelError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return await get_call(call_id, svc)
+
+
 @admin.get("/calls")
 async def list_calls(svc: Svc, limit: Annotated[int, Query(ge=1, le=500)] = 50) -> list[Call]:
     return [Call(**dict(r)) for r in await db.list_calls(svc.pool, limit)]
@@ -269,4 +306,12 @@ async def exotel_stream(ws: WebSocket) -> None:
         log.warning("media stream not started: %s", exc or type(exc).__name__)
         await media.close()
         return
-    await calls.run_call(svc, media, resolved.start, resolved.agent, resolved.call_id, resolved.caller_context)
+    await calls.run_call(
+        svc,
+        media,
+        resolved.start,
+        resolved.agent,
+        resolved.call_id,
+        resolved.caller_context,
+        campaign_id=resolved.campaign_id,
+    )

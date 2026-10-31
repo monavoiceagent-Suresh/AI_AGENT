@@ -15,7 +15,10 @@ MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 AGENT_COLUMNS = (
     "name, language, workflow, instructions, greeting, knowledge, collect_fields, "
-    "voice_id, tts_model_id, llm_model, is_inbound_default, client_id, persona_key"
+    "outcome_rules, outcome_fallback, "
+    "voice_id, tts_model_id, llm_model, "
+    "asr_provider, asr_fallback_provider, tts_provider, tts_fallback_provider, "
+    "is_inbound_default, client_id, persona_key"
 )
 _AGENT_PLACEHOLDERS = ", ".join(f"${n}" for n in range(1, len(AGENT_COLUMNS.split(",")) + 1))
 _AGENT_UPDATE_PLACEHOLDERS = ", ".join(f"${n}" for n in range(2, len(AGENT_COLUMNS.split(",")) + 2))
@@ -63,9 +66,15 @@ def _agent_args(agent: AgentIn) -> tuple[Any, ...]:
         agent.greeting,
         agent.knowledge,
         agent.collect_fields,
+        [r.model_dump() for r in agent.outcome_rules],
+        agent.outcome_fallback,
         agent.voice_id,
         agent.tts_model_id,
         agent.llm_model,
+        agent.asr_provider,
+        agent.asr_fallback_provider,
+        agent.tts_provider,
+        agent.tts_fallback_provider,
         agent.is_inbound_default,
         agent.client_id,
         agent.persona_key,
@@ -118,16 +127,21 @@ async def create_outbound_call(
     to_number: str,
     contact_name: str | None,
     dispatch_lead_id: int | None = None,
+    voice_id: str | None = None,
+    tts_model_id: str | None = None,
 ) -> int:
     return await pool.fetchval(
         "INSERT INTO calls (agent_id, direction, exotel_call_sid, from_number, to_number, contact_name, status, "
-        "dispatch_lead_id) VALUES ($1, 'outbound', $2, $3, $4, $5, 'initiated', $6) RETURNING id",
+        "dispatch_lead_id, voice_id, tts_model_id) VALUES ($1, 'outbound', $2, $3, $4, $5, 'initiated', $6, $7, $8) "
+        "RETURNING id",
         agent_id,
         call_sid,
         from_number,
         to_number,
         contact_name,
         dispatch_lead_id,
+        voice_id,
+        tts_model_id,
     )
 
 

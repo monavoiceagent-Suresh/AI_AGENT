@@ -392,4 +392,14 @@ def test_the_saved_route_carries_the_agent_persona_and_workspace_it_was_publishe
         "FROM inbound_routes r JOIN agents a ON a.id = r.agent_id WHERE r.phone = '918047491899'",
     )
     assert (row["client_id"], row["agent_client"], row["persona_key"]) == ("client-1", "client-1", "front-desk")
-    assert row["persona"] == PERSONA | {"version": 4, "greeting": "Latest greeting.", "knowledge": "Open nine to six."}
+    assert row["persona"] == PERSONA | {
+        "version": 4,
+        "greeting": "Latest greeting.",
+        "knowledge": "Open nine to six.",
+        "outcome_rules": [],
+        "outcome_fallback": None,
+        "asr_provider": None,
+        "asr_fallback_provider": None,
+        "tts_provider": None,
+        "tts_fallback_provider": None,
+    }

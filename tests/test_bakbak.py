@@ -111,7 +111,7 @@ def agent_in(**overrides) -> AgentIn:
 
 
 def test_voice_defaults_come_from_the_language_map_and_agents_can_override():
-    cfg = make_settings()
+    cfg = make_settings(tts_provider="bakbak")
     assert voice_for(agent_in(language="ta"), cfg) == Voice(voice_id="ta-voice", model_id="standard")
     assert voice_for(agent_in(language="en"), cfg) == Voice(voice_id="en-voice", model_id="m1")
     custom = agent_in(voice_id="custom", tts_model_id="m1")
@@ -119,7 +119,7 @@ def test_voice_defaults_come_from_the_language_map_and_agents_can_override():
 
 
 def test_bakbak_agent_validation():
-    cfg = make_settings(bakbak_voices={"ta": {"voice_id": "t", "model_id": "standard"}})
+    cfg = make_settings(tts_provider="bakbak", bakbak_voices={"ta": {"voice_id": "t", "model_id": "standard"}})
     assert validate_agent(agent_in(language="ta"), cfg) is None
     assert "no voice for language 'hi'" in validate_agent(agent_in(language="hi"), cfg)
     assert "together" in validate_agent(agent_in(voice_id="x"), cfg)
@@ -129,25 +129,25 @@ def test_bakbak_agent_validation():
 
 
 def test_elevenlabs_provider_keeps_its_language_rules():
-    cfg = make_settings(tts_provider="elevenlabs")
-    assert "eleven_v3" in validate_agent(agent_in(language="te"), cfg)
-    assert validate_agent(agent_in(language="te", tts_model_id="eleven_v3"), cfg) is None
+    cfg = make_settings(tts_provider="elevenlabs_standard")
+    assert "cannot speak language 'te'" in validate_agent(agent_in(language="te"), cfg)
     assert voice_for(agent_in(language="hi"), cfg) == Voice(voice_id="el-voice", model_id="eleven_flash_v2_5")
 
 
-def test_fallback_voice_only_when_enabled_and_the_language_is_supported():
-    assert fallback_voice_for(agent_in(language="ta"), make_settings()) is None
-    cfg = make_settings(tts_fallback_enabled=True)
+def test_fallback_voice_only_when_configured_and_the_language_is_supported():
+    assert fallback_voice_for(agent_in(language="ta"), make_settings(tts_fallback_provider=None)) is None
+    cfg = make_settings(tts_provider="bakbak", tts_fallback_provider="elevenlabs_standard")
     assert fallback_voice_for(agent_in(language="ta"), cfg) == Voice(voice_id="el-voice", model_id="eleven_flash_v2_5")
     assert fallback_voice_for(agent_in(language="te"), cfg) is None  # Flash v2.5 cannot speak Telugu
-    assert fallback_voice_for(agent_in(language="ta"), make_settings(tts_provider="elevenlabs")) is None
 
 
-def test_settings_reject_an_unusable_tts_configuration():
-    with pytest.raises(ValueError, match="BAKBAK_API_KEY"):
-        make_settings(bakbak_api_key=None)
-    with pytest.raises(ValueError, match="BAKBAK_VOICES"):
-        make_settings(bakbak_voices={})
-    with pytest.raises(ValueError, match="ELEVENLABS_TTS_VOICE_ID"):
-        make_settings(tts_fallback_enabled=True, elevenlabs_tts_voice_id="")
-    assert isinstance(make_settings(tts_provider="elevenlabs", bakbak_api_key=None, bakbak_voices={}), Settings)
+def test_settings_reject_an_unusable_primary_tts_configuration():
+    with pytest.raises(ValueError, match="missing its required credentials"):
+        make_settings(tts_provider="bakbak", bakbak_api_key=None)
+    with pytest.raises(ValueError, match="missing its required credentials"):
+        make_settings(tts_provider="bakbak", bakbak_voices={})
+    with pytest.raises(ValueError, match="missing its required credentials"):
+        make_settings(elevenlabs_tts_voice_id="")
+    assert isinstance(
+        make_settings(tts_provider="elevenlabs_standard", bakbak_api_key=None, bakbak_voices={}), Settings
+    )

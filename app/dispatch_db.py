@@ -15,7 +15,23 @@ class OpenJobExists(Exception):
     """The campaign already has a job that has not been finalized."""
 
 
-PERSONA_FIELDS = ("name", "language", "workflow", "instructions", "greeting", "knowledge")
+PERSONA_FIELDS = (
+    "name",
+    "language",
+    "workflow",
+    "instructions",
+    "greeting",
+    "knowledge",
+    "outcome_rules",
+    "outcome_fallback",
+    "asr_provider",
+    "asr_fallback_provider",
+    "tts_provider",
+    "tts_fallback_provider",
+)
+# These default to None on both AgentIn and PersonaIn, so a persona JSON blob saved before they existed
+# (an old route or job) simply has none chosen, exactly like a fresh one with no override at all.
+PERSONA_OPTIONAL_FIELDS = frozenset({"asr_provider", "asr_fallback_provider", "tts_provider", "tts_fallback_provider"})
 
 
 async def job_by_key(pool: asyncpg.Pool, idempotency_key: str) -> asyncpg.Record | None:
@@ -23,17 +39,23 @@ async def job_by_key(pool: asyncpg.Pool, idempotency_key: str) -> asyncpg.Record
 
 
 async def upsert_persona_agent(conn: asyncpg.Connection, client_id: str, persona: PersonaIn) -> int:
-    """The agent row for (client, persona key): created if missing, its text refreshed, its voice settings kept.
+    """The agent row for (client, persona key): created if missing, its text refreshed.
 
-    Calls never read this text (they use the job's copy); the row exists to hold voice and model overrides
-    and to give calls an agent id.
+    The row's voice is never set here. A campaign or test call's voice belongs to that call (see calls.py), so
+    two campaigns sharing a persona cannot change each other's voice. The voice is cleared only when the
+    language changes, because the old voice cannot speak the new language.
     """
     return await conn.fetchval(
-        "INSERT INTO agents (name, language, workflow, instructions, greeting, knowledge, client_id, persona_key) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) "
+        "INSERT INTO agents (name, language, workflow, instructions, greeting, knowledge, outcome_rules, "
+        "outcome_fallback, asr_provider, asr_fallback_provider, tts_provider, tts_fallback_provider, "
+        "client_id, persona_key) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) "
         "ON CONFLICT (client_id, persona_key) WHERE persona_key IS NOT NULL DO UPDATE SET "
         "name = EXCLUDED.name, workflow = EXCLUDED.workflow, instructions = EXCLUDED.instructions, "
         "greeting = EXCLUDED.greeting, knowledge = EXCLUDED.knowledge, "
+        "outcome_rules = EXCLUDED.outcome_rules, outcome_fallback = EXCLUDED.outcome_fallback, "
+        "asr_provider = EXCLUDED.asr_provider, asr_fallback_provider = EXCLUDED.asr_fallback_provider, "
+        "tts_provider = EXCLUDED.tts_provider, tts_fallback_provider = EXCLUDED.tts_fallback_provider, "
         "voice_id = CASE WHEN agents.language <> EXCLUDED.language THEN NULL ELSE agents.voice_id END, "
         "tts_model_id = CASE WHEN agents.language <> EXCLUDED.language THEN NULL ELSE agents.tts_model_id END, "
         "language = EXCLUDED.language, updated_at = now() RETURNING id",
@@ -43,15 +65,21 @@ async def upsert_persona_agent(conn: asyncpg.Connection, client_id: str, persona
         persona.instructions,
         persona.greeting,
         persona.knowledge,
+        [r.model_dump() for r in persona.outcome_rules],
+        persona.outcome_fallback,
+        persona.asr_provider,
+        persona.asr_fallback_provider,
+        persona.tts_provider,
+        persona.tts_fallback_provider,
         client_id,
         persona.key,
     )
 
 
-async def get_job_persona(pool: asyncpg.Pool, dispatch_lead_id: int) -> dict[str, Any] | None:
-    """The persona copy of the job a lead belongs to (None for jobs created without one)."""
-    return await pool.fetchval(
-        "SELECT j.persona FROM dispatch_leads l JOIN dispatch_jobs j ON j.id = l.job_id WHERE l.id = $1",
+async def get_job_runtime(pool: asyncpg.Pool, dispatch_lead_id: int) -> asyncpg.Record | None:
+    """The job a lead belongs to: its persona copy (None for jobs created without one) and campaign."""
+    return await pool.fetchrow(
+        "SELECT j.persona, j.campaign_id FROM dispatch_leads l JOIN dispatch_jobs j ON j.id = l.job_id WHERE l.id = $1",
         dispatch_lead_id,
     )
 
@@ -63,8 +91,8 @@ async def create_job(pool: asyncpg.Pool, request: DispatchIn) -> str:
             agent_id = await upsert_persona_agent(conn, request.client_id, request.persona)
             job_id = await conn.fetchval(
                 "INSERT INTO dispatch_jobs (idempotency_key, client_id, campaign_id, agent_id, status, window_start, "
-                "window_end, max_tries, retry_gap_minutes, webhook_url, persona) "
-                "VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10) RETURNING id",
+                "window_end, max_tries, retry_gap_minutes, webhook_url, persona, voice_id, tts_model_id) "
+                "VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
                 request.idempotency_key,
                 request.client_id,
                 request.campaign_id,
@@ -75,6 +103,8 @@ async def create_job(pool: asyncpg.Pool, request: DispatchIn) -> str:
                 request.retry_policy.retry_gap_minutes,
                 request.webhook_url,
                 request.persona.model_dump(),
+                request.voice_id,
+                request.tts_model_id,
             )
             await conn.executemany(
                 "INSERT INTO dispatch_leads (job_id, lead_id, phone, name) VALUES ($1, $2, $3, $4)",
@@ -112,7 +142,7 @@ async def next_due_lead(pool: asyncpg.Pool) -> asyncpg.Record | None:
     """The next lead to call: due, its job open, and the current India time inside the job's calling window."""
     return await pool.fetchrow(
         "SELECT l.id AS lead_pk, l.lead_id, l.phone, l.name, l.attempts, j.id AS job_id, j.status AS job_status, "
-        "j.agent_id, j.max_tries, j.retry_gap_minutes "
+        "j.agent_id, j.max_tries, j.retry_gap_minutes, j.voice_id, j.tts_model_id "
         "FROM dispatch_leads l JOIN dispatch_jobs j ON j.id = l.job_id "
         "WHERE l.status = 'pending' AND l.next_attempt_at <= now() AND j.status IN ('queued', 'running') "
         "AND to_char(now() AT TIME ZONE 'Asia/Kolkata', 'HH24:MI') BETWEEN j.window_start AND j.window_end "

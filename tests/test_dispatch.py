@@ -151,6 +151,94 @@ def test_dispatch_needs_the_token_and_a_valid_body(client):  # noqa: F811
     assert client.post("/campaigns/dispatch", json=empty_greeting, headers=ADMIN).status_code == 422
 
 
+def shared_agent(client) -> dict:  # noqa: F811
+    return next(a for a in client.get("/agents", headers=ADMIN).json() if a["persona_key"] == PERSONA["key"])
+
+
+def test_a_campaign_voice_reaches_the_tts_request_and_leaves_the_shared_agent_alone(ready):
+    start(ready, voiceId="campaign-voice", ttsModelId="m1")
+    wait_until(lambda: ready.app.state.services.exotel.dialled)
+    first_call_id(ready)
+    converse(ready, "CAout1")
+
+    assert set(ready.app.state.services.tts.voices) == {("campaign-voice", "m1")}
+    assert shared_agent(ready)["voice_id"] is None
+
+
+def test_two_campaigns_on_one_persona_each_speak_with_their_own_voice(ready):
+    start(ready, voiceId="voice-one", ttsModelId="m1")
+    start(
+        ready,
+        campaignId="campaign-2",
+        voiceId="voice-two",
+        ttsModelId="standard",
+        leads=[{"id": "lead-2", "phone": "+919876543211"}],
+    )
+    services = ready.app.state.services
+    services.llm.replies.append("Thank you, goodbye. <end_call>")
+
+    wait_until(lambda: len(services.exotel.dialled) == 1)
+    wait_until(lambda: len(ready.get("/calls", headers=ADMIN).json()) == 1)
+    converse(ready, "CAout1")
+    first_call_voices = len(services.tts.voices)
+    wait_until(lambda: len(services.exotel.dialled) == 2)
+    wait_until(lambda: len(ready.get("/calls", headers=ADMIN).json()) == 2)
+    converse(ready, "CAout2")
+
+    assert set(services.tts.voices[:first_call_voices]) == {("voice-one", "m1")}
+    assert set(services.tts.voices[first_call_voices:]) == {("voice-two", "standard")}
+    assert shared_agent(ready)["voice_id"] is None
+
+
+def test_a_campaign_without_a_voice_speaks_the_language_default(ready):
+    start(ready)
+    wait_until(lambda: ready.app.state.services.exotel.dialled)
+    first_call_id(ready)
+    converse(ready, "CAout1")
+
+    assert set(ready.app.state.services.tts.voices) == {("en-voice", "m1")}
+
+
+def test_each_call_end_is_logged_with_its_campaign_persona_voice_and_outcome(ready, caplog):
+    caplog.set_level("INFO")
+    start(ready, voiceId="campaign-voice", ttsModelId="m1")
+    wait_until(lambda: ready.app.state.services.exotel.dialled)
+    first_call_id(ready)
+    converse(ready, "CAout1")
+    wait_until(lambda: any("ended: campaign=" in r.getMessage() for r in caplog.records))
+
+    line = next(r.getMessage() for r in caplog.records if "ended: campaign=" in r.getMessage())
+    assert "campaign=campaign-1" in line and f"persona={PERSONA['key']}" in line
+    assert "voice=campaign-voice/m1" in line and "duration=" in line and "outcome=" in line and "cost_inr=" in line
+    assert "+919876543210" not in line and "Ravi" not in line
+
+
+def test_a_dispatched_campaigns_outcome_rules_are_applied_to_its_agent(ready):
+    persona = PERSONA | {
+        "outcomeRules": [{"name": "Interested", "definition": "Clear positive response."}],
+        "outcomeFallback": "No decision.",
+    }
+    start(ready, persona=persona)
+
+    agents = ready.get("/agents", headers=ADMIN).json()
+    agent = next(a for a in agents if a["persona_key"] == PERSONA["key"])
+    assert agent["outcome_rules"] == [{"name": "Interested", "definition": "Clear positive response."}]
+    assert agent["outcome_fallback"] == "No decision."
+
+
+def test_dispatch_rejects_an_outcome_rule_named_inconclusive(ready):
+    persona = PERSONA | {"outcomeRules": [{"name": "Inconclusive", "definition": "x"}], "outcomeFallback": "y"}
+    body = dispatch_body(persona=persona)
+    rejected = ready.post("/campaigns/dispatch", json=body, headers=ADMIN)
+    assert rejected.status_code == 422
+
+
+def test_dispatch_rejects_a_half_set_voice_choice(ready):
+    body = dispatch_body(voiceId="only-this")
+    rejected = ready.post("/campaigns/dispatch", json=body, headers=ADMIN).json()
+    assert rejected["status"] == "rejected" and "together" in rejected["reason"]
+
+
 def test_dispatch_is_rejected_with_a_reason_until_calling_is_possible(client, sink):  # noqa: F811
     body = dispatch_body()
     outbound_off = client.post("/campaigns/dispatch", json=body, headers=ADMIN).json()

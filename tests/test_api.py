@@ -8,6 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import asyncpg
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -104,7 +105,7 @@ def client(monkeypatch):
         "MAX_CONCURRENT_CALLS": "1",
         "ELEVENLABS_TTS_MODEL_ID": "eleven_flash_v2_5",
         "TTS_PROVIDER": "bakbak",
-        "TTS_FALLBACK_ENABLED": "false",
+        "TTS_FALLBACK_PROVIDER": "elevenlabs_standard",
         "BAKBAK_INR_PER_1K_CHARS": "2.5",
         "BAKBAK_API_KEY": "test-bakbak",
         "BAKBAK_VOICES": json.dumps(
@@ -162,6 +163,40 @@ def test_agent_crud_and_validation(client):
     assert client.get("/agents/999", headers=ADMIN).status_code == 404
 
 
+def test_voices_endpoint_requires_auth(client):
+    assert client.get("/voices").status_code == 401
+
+
+def test_voices_endpoint_proxies_the_configured_providers_real_voices(client):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers["x-api-key"]))
+        return httpx.Response(200, json=[{"voice_id": "v1", "name": "Anitha", "model_id": "standard"}])
+
+    client.app.state.services.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    response = client.get("/voices", headers=ADMIN)
+
+    assert response.status_code == 200, response.text
+    assert seen == [("https://hub.getraya.app/v1/voices", "test-bakbak")]  # the fixture's BAKBAK_API_KEY
+    assert response.json() == {
+        "provider": "bakbak",
+        "voices": [{"voiceId": "v1", "name": "Anitha", "language": None, "modelId": "standard"}],
+    }
+
+
+def test_voices_endpoint_maps_a_provider_failure_to_502_not_a_crash(client):
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    client.app.state.services.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    response = client.get("/voices", headers=ADMIN)
+
+    assert response.status_code == 502
+
+
 def test_outbound_call_lifecycle_until_status_callback(client):
     agent = client.post("/agents", json=APPOINTMENT_AGENT, headers=ADMIN).json()
     body = {"agent_id": agent["id"], "to": "+919876543210"}
@@ -179,6 +214,170 @@ def test_outbound_call_lifecycle_until_status_callback(client):
     call = client.get(f"/calls/{placed.json()['id']}", headers=ADMIN).json()
     assert call["status"] == "no_answer" and call["ended_at"] is not None
     assert client.post("/calls", json=body, headers=ADMIN).status_code == 201  # capacity released
+
+
+def _persona(**overrides) -> dict:
+    return {
+        "key": "clinic-test",
+        "name": "Clinic",
+        "language": "en",
+        "workflow": "appointment",
+        "instructions": "You book appointments for Sunrise Clinic. Context: [[CALLER_CONTEXT]]",
+        "greeting": "Hello from Sunrise Clinic.",
+        "knowledge": "",
+        "version": 1,
+        **overrides,
+    }
+
+
+def test_test_call_creates_the_agent_from_a_persona_and_places_the_call(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    body = {"clientId": "client-1", "persona": _persona(), "to": "+919876543210", "contactName": "Asha"}
+
+    placed = client.post("/calls/test", json=body, headers=ADMIN)
+
+    assert placed.status_code == 201, placed.text
+    created = placed.json()
+    assert created["status"] == "initiated" and created["contact_name"] == "Asha"
+    agents = client.get("/agents", headers=ADMIN).json()
+    agent = next(a for a in agents if a["persona_key"] == "clinic-test" and a["client_id"] == "client-1")
+    assert agent["id"] == created["agent_id"]
+    assert agent["name"] == "Clinic" and agent["workflow"] == "appointment"
+
+
+def test_test_call_reuses_the_same_agent_on_a_second_call(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    body = {"clientId": "client-1", "persona": _persona(), "to": "+919876543210"}
+    first = client.post("/calls/test", json=body, headers=ADMIN).json()
+    client.post("/exotel/status?token=test-hook", data={"CallSid": first["exotel_call_sid"], "Status": "no-answer"})
+
+    body["to"] = "+919876543211"
+    second = client.post("/calls/test", json=body, headers=ADMIN).json()
+
+    assert first["agent_id"] == second["agent_id"]
+    agents = [a for a in client.get("/agents", headers=ADMIN).json() if a["persona_key"] == "clinic-test"]
+    assert len(agents) == 1  # updated in place, not duplicated
+
+
+def test_test_call_is_rejected_for_an_unspeakable_persona(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    del client.app.state.services.settings.bakbak_voices["te"]  # simulate BAKBAK_VOICES missing this language
+    body = {"clientId": "client-1", "persona": _persona(language="te"), "to": "+919876543210"}
+
+    rejected = client.post("/calls/test", json=body, headers=ADMIN)
+
+    assert rejected.status_code == 422
+
+
+def test_test_call_respects_outbound_disabled_and_capacity(client):
+    body = {"clientId": "client-1", "persona": _persona(), "to": "+919876543210"}
+    assert client.post("/calls/test", json=body, headers=ADMIN).status_code == 409  # outbound disabled
+
+    client.app.state.services.settings.enable_outbound_calls = True
+    assert client.post("/calls/test", json=body, headers=ADMIN).status_code == 201
+    assert client.post("/calls/test", json=body, headers=ADMIN).status_code == 409  # capacity held while ringing
+
+
+def test_test_call_applies_the_personas_outcome_rules_to_the_agent(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    persona = _persona(
+        key="outcome-persona",
+        outcomeRules=[{"name": "Interested", "definition": "Clear positive response."}],
+        outcomeFallback="No decision.",
+    )
+    body = {"clientId": "client-1", "persona": persona, "to": "+919876543210"}
+
+    placed = client.post("/calls/test", json=body, headers=ADMIN)
+
+    assert placed.status_code == 201, placed.text
+    agent = client.get(f"/agents/{placed.json()['agent_id']}", headers=ADMIN).json()
+    assert agent["outcome_rules"] == [{"name": "Interested", "definition": "Clear positive response."}]
+    assert agent["outcome_fallback"] == "No decision."
+
+
+def test_test_call_rejects_an_outcome_rule_named_inconclusive(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    persona = _persona(outcomeRules=[{"name": "Inconclusive", "definition": "x"}], outcomeFallback="y")
+    body = {"clientId": "client-1", "persona": persona, "to": "+919876543210"}
+
+    rejected = client.post("/calls/test", json=body, headers=ADMIN)
+
+    assert rejected.status_code == 422
+
+
+def test_test_call_applies_the_chosen_voice_to_the_agent(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    body = {
+        "clientId": "client-1",
+        "persona": _persona(key="voiced-persona"),
+        "to": "+919876543210",
+        "voiceId": "chosen-voice",
+        "ttsModelId": "m1",
+    }
+
+    placed = client.post("/calls/test", json=body, headers=ADMIN)
+
+    assert placed.status_code == 201, placed.text
+    call = client.portal.call(
+        client.app.state.services.pool.fetchrow,
+        "SELECT voice_id, tts_model_id FROM calls WHERE id = $1",
+        placed.json()["id"],
+    )
+    assert (call["voice_id"], call["tts_model_id"]) == ("chosen-voice", "m1")
+    agent = client.get(f"/agents/{placed.json()['agent_id']}", headers=ADMIN).json()
+    assert agent["voice_id"] is None  # the choice belongs to this call, not to the shared persona agent
+
+
+def test_test_call_rejects_a_half_set_voice_choice(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    body = {"clientId": "client-1", "persona": _persona(), "to": "+919876543210", "voiceId": "only-this"}
+
+    rejected = client.post("/calls/test", json=body, headers=ADMIN)
+
+    assert rejected.status_code == 422 and "together" in rejected.json()["detail"]
+
+
+def test_test_call_rejects_an_unsupported_model(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    body = {
+        "clientId": "client-1",
+        "persona": _persona(),
+        "to": "+919876543210",
+        "voiceId": "v",
+        "ttsModelId": "not-a-real-model",
+    }
+
+    rejected = client.post("/calls/test", json=body, headers=ADMIN)
+
+    assert rejected.status_code == 422 and "Unsupported Bakbak model" in rejected.json()["detail"]
+
+
+def test_a_later_test_call_with_no_voice_choice_does_not_inherit_an_earlier_one(client):
+    client.app.state.services.settings.enable_outbound_calls = True
+    persona = _persona(key="sticky-voice-persona")
+    first = client.post(
+        "/calls/test",
+        json={"clientId": "client-1", "persona": persona, "to": "+919876543210", "voiceId": "v1", "ttsModelId": "m1"},
+        headers=ADMIN,
+    )
+    client.post(
+        "/exotel/status?token=test-hook",
+        data={"CallSid": first.json()["exotel_call_sid"], "Status": "no-answer"},
+    )
+
+    second = client.post(
+        "/calls/test", json={"clientId": "client-1", "persona": persona, "to": "+919876543211"}, headers=ADMIN
+    )
+
+    assert second.status_code == 201, second.text
+    call = client.portal.call(
+        client.app.state.services.pool.fetchrow,
+        "SELECT voice_id, tts_model_id FROM calls WHERE id = $1",
+        second.json()["id"],
+    )
+    assert (call["voice_id"], call["tts_model_id"]) == (None, None)
+    agent = client.get(f"/agents/{second.json()['agent_id']}", headers=ADMIN).json()
+    assert agent["voice_id"] is None
 
 
 def test_media_stream_rejects_missing_credentials(client):

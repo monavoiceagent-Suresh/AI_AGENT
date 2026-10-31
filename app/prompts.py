@@ -93,14 +93,29 @@ def system_prompt(agent: Agent, context: str, now: datetime | None = None) -> st
     return "\n\n".join(parts)
 
 
+def _valid_outcomes(agent: Agent) -> list[str]:
+    """A persona's own Call Outcome Rules, if it has any, otherwise the fixed list for its workflow."""
+    if agent.outcome_rules:
+        return [rule.name for rule in agent.outcome_rules] + ["Inconclusive"]
+    return list(OUTCOMES[agent.workflow])
+
+
 def outcome_messages(agent: Agent, transcript: list[tuple[str, str]]) -> list[dict[str, str]]:
     lines = "\n".join(f"{speaker}: {text}" for speaker, text in transcript)
     fields = agent.collect_fields or []
     schema = {
-        "outcome": " | ".join(OUTCOMES[agent.workflow]),
+        "outcome": " | ".join(_valid_outcomes(agent)),
         "fields": {name: "value stated by the caller, or null" for name in fields},
         "summary": "two-sentence English summary of the call",
     }
+    if agent.outcome_rules:
+        definitions = "\n".join(f"- {rule.name}: {rule.definition}" for rule in agent.outcome_rules)
+        goal = (
+            "Classify the call's outcome using exactly these definitions (highest matching one wins; "
+            f"use Inconclusive only if none clearly apply):\n{definitions}\n- Inconclusive: {agent.outcome_fallback}"
+        )
+    else:
+        goal = f"Call goal: {WORKFLOW_GOALS[agent.workflow]}"
     return [
         {
             "role": "system",
@@ -109,7 +124,7 @@ def outcome_messages(agent: Agent, transcript: list[tuple[str, str]]) -> list[di
         {
             "role": "user",
             "content": (
-                f"Call goal: {WORKFLOW_GOALS[agent.workflow]}\n\nTranscript:\n{lines}\n\n"
+                f"{goal}\n\nTranscript:\n{lines}\n\n"
                 f"Return JSON with exactly this shape:\n{json.dumps(schema, ensure_ascii=False)}"
             ),
         },
@@ -123,7 +138,7 @@ def parse_outcome(agent: Agent, raw: str) -> tuple[str, dict[str, Any], str]:
         data = json.loads(raw[start : end + 1]) if start != -1 else None
     except json.JSONDecodeError:
         data = None
-    if not isinstance(data, dict) or data.get("outcome") not in OUTCOMES[agent.workflow]:
+    if not isinstance(data, dict) or data.get("outcome") not in _valid_outcomes(agent):
         return "extraction_failed", {}, ""
     fields = data.get("fields") if isinstance(data.get("fields"), dict) else {}
     return data["outcome"], fields, str(data.get("summary") or "")
