@@ -30,8 +30,10 @@ class ElevenLabsTTS:
             "text": text,
             "model_id": model_id,
             "voice_settings": self._voice_settings,
-            "previous_text": previous_text or None,
         }
+        # eleven_v3 rejects text continuity fields, including previous_text set to null.
+        if model_id != "eleven_v3":
+            body["previous_text"] = previous_text or None
         # multilingual_v2 rejects language_code; the other supported models accept it.
         if model_id != "eleven_multilingual_v2":
             body["language_code"] = language
