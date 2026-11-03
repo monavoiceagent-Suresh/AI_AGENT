@@ -1,7 +1,8 @@
 """Queries for dashboard campaign dispatch: jobs, per-lead state and the webhook outbox."""
 
 import json
-from datetime import datetime
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
@@ -107,10 +108,22 @@ async def create_job(pool: asyncpg.Pool, request: DispatchIn) -> str:
                 request.tts_model_id,
             )
             await conn.executemany(
-                "INSERT INTO dispatch_leads (job_id, lead_id, phone, name) VALUES ($1, $2, $3, $4)",
-                [(job_id, lead.id, lead.phone, lead.name) for lead in request.leads],
+                "INSERT INTO dispatch_leads (job_id, lead_id, phone, name, next_attempt_at, attempts) "
+                "VALUES ($1, $2, $3, $4, COALESCE($5, now()), $6)",
+                [
+                    (
+                        job_id, lead.id, lead.phone, lead.name,
+                        max((d for d in (request.not_before, lead.next_attempt_at) if d is not None), default=None),
+                        lead.attempts,
+                    )
+                    for lead in request.leads
+                ],
             )
     except asyncpg.UniqueViolationError as exc:
+        # Concurrent retries can both miss job_by_key before either transaction commits.
+        existing = await job_by_key(pool, request.idempotency_key)
+        if existing is not None:
+            return str(existing["id"])
         if exc.constraint_name == "dispatch_jobs_one_open_per_campaign":
             raise OpenJobExists from exc
         raise
@@ -145,6 +158,7 @@ async def next_due_lead(pool: asyncpg.Pool) -> asyncpg.Record | None:
         "j.agent_id, j.max_tries, j.retry_gap_minutes, j.voice_id, j.tts_model_id "
         "FROM dispatch_leads l JOIN dispatch_jobs j ON j.id = l.job_id "
         "WHERE l.status = 'pending' AND l.next_attempt_at <= now() AND j.status IN ('queued', 'running') "
+        "AND l.attempts < j.max_tries "
         "AND to_char(now() AT TIME ZONE 'Asia/Kolkata', 'HH24:MI') BETWEEN j.window_start AND j.window_end "
         "ORDER BY l.next_attempt_at, l.id LIMIT 1"
     )
@@ -189,14 +203,25 @@ async def abandon_stale_calls(pool: asyncpg.Pool, ringing_seconds: int, connecte
 
 
 async def release_unplaced_claims(pool: asyncpg.Pool, older_than_seconds: int) -> int:
-    """A claim with no call row (crash between claiming and dialling) goes back to pending."""
-    result = await pool.execute(
-        "UPDATE dispatch_leads l SET status = 'pending', attempts = attempts - 1, claimed_at = NULL "
-        "WHERE l.status = 'calling' AND l.claimed_at < now() - make_interval(secs => $1) "
-        "AND NOT EXISTS (SELECT 1 FROM calls c WHERE c.dispatch_lead_id = l.id AND c.created_at >= l.claimed_at)",
-        older_than_seconds,
-    )
-    return int(result.split()[-1])
+    """Fail closed after a crash with unknown placement; requeueing could dial somebody twice."""
+    async with pool.acquire() as conn, conn.transaction():
+        rows = await conn.fetch(
+            "UPDATE dispatch_leads l SET status = 'failed', last_outcome = 'placement_unknown', claimed_at = NULL "
+            "WHERE l.status = 'calling' AND l.claimed_at < now() - make_interval(secs => $1) "
+            "AND NOT EXISTS (SELECT 1 FROM calls c WHERE c.dispatch_lead_id = l.id AND c.created_at >= l.claimed_at) "
+            "RETURNING l.job_id, l.lead_id, l.phone, l.attempts",
+            older_than_seconds,
+        )
+        for row in rows:
+            await enqueue_event(conn, row["job_id"], {
+                "eventId": str(uuid.uuid4()), "eventType": "call.failed",
+                "engineJobId": str(row["job_id"]), "occurredAt": datetime.now(UTC).isoformat(),
+                "data": {
+                    "leadId": row["lead_id"], "leadPhone": row["phone"], "attempt": row["attempts"],
+                    "outcome": "placement_unknown", "durationSeconds": 0, "leadState": "exhausted",
+                },
+            })
+    return len(rows)
 
 
 async def finished_attempts(pool: asyncpg.Pool) -> list[asyncpg.Record]:

@@ -358,16 +358,18 @@ def test_a_dispatched_lead_is_called_and_reported_with_a_signed_webhook(ready, s
     converse(ready, "CAout1")
 
     wait_until(lambda: "job.completed" in sink.types())
-    assert sink.types() == ["call.completed", "job.completed"]
+    assert sink.types() == ["call.started", "call.completed", "job.completed"]
     for delivery in sink.deliveries:
         expected = hmac.new(SECRET, delivery["body"], "sha256").hexdigest()
         assert hmac.compare_digest(delivery["signature"], expected)
 
-    call_event, job_event = (event(d) for d in sink.deliveries)
+    started_event, call_event, job_event = (event(d) for d in sink.deliveries)
+    assert started_event["data"]["engineCallId"] == str(call_id)
     assert call_event["engineJobId"] == job_event["engineJobId"] == job_id
     assert call_event["data"] == {
         "leadId": "lead-1",
         "leadPhone": "+919876543210",
+        "callerNumber": ready.app.state.services.settings.exotel_caller_id,
         "outcome": "appointment_requested",
         "durationSeconds": call_event["data"]["durationSeconds"],
         "attempt": 1,
@@ -388,8 +390,8 @@ def test_an_unanswered_lead_is_retried_and_then_given_up_on(ready, sink):
     first_call_id(ready)
     no_answer(ready, "CAout1")
 
-    wait_until(lambda: sink.types() == ["call.failed"])
-    retry = event(sink.deliveries[0])["data"]
+    wait_until(lambda: sink.types() == ["call.started", "call.failed"])
+    retry = event(sink.deliveries[1])["data"]
     assert retry["outcome"] == "no_answer" and retry["leadState"] == "retry" and retry["attempt"] == 1
     assert datetime.fromisoformat(retry["nextAttemptAt"]) > datetime.now(UTC)
     assert len(ready.app.state.services.exotel.dialled) == 1  # the gap has not passed
@@ -400,7 +402,7 @@ def test_an_unanswered_lead_is_retried_and_then_given_up_on(ready, sink):
     no_answer(ready, "CAout2")
 
     wait_until(lambda: "job.completed" in sink.types())
-    last = event(sink.deliveries[1])["data"]
+    last = event(sink.deliveries[-2])["data"]
     assert last["leadState"] == "exhausted" and last["attempt"] == 2
     job = ready.get(f"/jobs/{job_id}", headers=ADMIN).json()
     assert (job["status"], job["callsCompleted"], job["callsFailed"]) == ("completed", 0, 1)
@@ -417,7 +419,7 @@ def test_cancelling_stops_new_calls_and_still_reports_the_one_in_flight(ready, s
     no_answer(ready, "CAout1")
 
     wait_until(lambda: "job.cancelled" in sink.types())
-    assert event(sink.deliveries[0])["data"]["leadState"] == "queued"
+    assert event(sink.deliveries[-2])["data"]["leadState"] == "queued"
     assert len(ready.app.state.services.exotel.dialled) == 1
 
     # The campaign can be dispatched again once the cancelled job has finished.
@@ -442,5 +444,5 @@ def test_a_failed_delivery_is_retried_without_losing_or_reordering_events(ready,
     no_answer(ready, "CAout1")
 
     wait_until(lambda: "job.completed" in sink.types())
-    assert sink.types() == ["call.failed", "job.completed"]
-    assert event(sink.deliveries[0])["data"]["leadState"] == "exhausted"
+    assert sink.types() == ["call.started", "call.failed", "job.completed"]
+    assert event(sink.deliveries[1])["data"]["leadState"] == "exhausted"

@@ -29,7 +29,9 @@ CONNECT_TIMEOUT_SECONDS = 15
 
 
 class ExotelError(Exception):
-    pass
+    def __init__(self, message: str, *, placement_unknown: bool = False):
+        super().__init__(message)
+        self.placement_unknown = placement_unknown
 
 
 @dataclass(frozen=True)
@@ -98,12 +100,17 @@ class ExotelClient:
                 timeout=CONNECT_TIMEOUT_SECONDS,
             )
             if response.status_code >= 400:
-                raise ExotelError(f"Exotel connect failed ({response.status_code}): {response.text[:500]}")
+                raise ExotelError(
+                    f"Exotel connect failed ({response.status_code}): {response.text[:500]}",
+                    placement_unknown=response.status_code >= 500,
+                )
             return response.json()["Call"]["Sid"]
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             # A timeout or a bad body: the call may or may not have been placed, but it is never an unhandled 500
             # on POST /calls, and the dispatcher settles the attempt instead of leaving its lead claimed.
-            raise ExotelError(f"Exotel connect failed: {type(exc).__name__}") from exc
+            # The provider may already be dialling. Never automatically issue another dial
+            # merely because its response was lost or unreadable.
+            raise ExotelError(f"Exotel connect failed: {type(exc).__name__}", placement_unknown=True) from exc
 
 
 @dataclass(frozen=True)

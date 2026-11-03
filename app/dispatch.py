@@ -93,6 +93,7 @@ async def settle_attempt(
     data: dict[str, Any] = {
         "leadId": attempt["lead_id"],
         "leadPhone": attempt["phone"],
+        "callerNumber": svc.settings.exotel_caller_id,
         "outcome": outcome,
         "durationSeconds": round(seconds),
         "attempt": attempt["attempts"],
@@ -158,7 +159,7 @@ async def place_next_call(svc: Services) -> bool:
     attempt = {**lead, "attempts": lead["attempts"] + 1}
     agent = Agent(**dict(await db.get_agent(svc.pool, lead["agent_id"])))
     try:
-        await calls.place_outbound_call(
+        call_id = await calls.place_outbound_call(
             svc,
             agent,
             lead["phone"],
@@ -172,9 +173,30 @@ async def place_next_call(svc: Services) -> bool:
         return False
     except ExotelError as exc:
         log.warning("could not dial lead %s: %s", lead["lead_id"], exc)
-        await settle_attempt(svc, attempt, call_id=None, connected=False, outcome="dial_failed", seconds=0.0)
+        unknown = exc.placement_unknown
+        await settle_attempt(
+            svc,
+            {**attempt, "max_tries": attempt["attempts"]} if unknown else attempt,
+            call_id=None, connected=False, outcome="placement_unknown" if unknown else "dial_failed", seconds=0.0,
+        )
         return True
     await dispatch_db.mark_job_running(svc.pool, lead["job_id"])
+    await dispatch_db.enqueue_event(
+        svc.pool,
+        lead["job_id"],
+        {
+            "eventId": str(uuid.uuid4()),
+            "eventType": "call.started",
+            "engineJobId": str(lead["job_id"]),
+            "occurredAt": datetime.now(UTC).isoformat(),
+            "data": {
+                "engineCallId": str(call_id),
+                "leadId": lead["lead_id"],
+                "leadPhone": lead["phone"],
+                "callerNumber": svc.settings.exotel_caller_id,
+            },
+        },
+    )
     return True
 
 

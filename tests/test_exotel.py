@@ -137,7 +137,9 @@ async def test_connect_to_flow_failures_are_all_exotel_errors(answer):
             caller_id="0",
             app_id="9",
         )
-        with pytest.raises(ExotelError):
+        with pytest.raises(ExotelError) as caught:
             await client.connect_to_flow(
                 "+919876543210", status_callback="https://x/cb", time_limit=60, ring_timeout=45
             )
+        confirmed_refusal = isinstance(answer, httpx.Response) and 400 <= answer.status_code < 500
+        assert caught.value.placement_unknown is not confirmed_refusal

@@ -58,7 +58,7 @@ admin = APIRouter(dependencies=[Depends(require_admin)])
 @public.get("/health")
 async def health(svc: Svc) -> dict:
     await svc.pool.fetchval("SELECT 1")
-    return {"status": "ok", "active_calls": svc.active_calls}
+    return {"status": "ok", "active_calls": svc.active_calls, "outbound_dispatch_version": 1}
 
 
 # ---- agents ---------------------------------------------------------------------------
@@ -204,9 +204,27 @@ async def place_call(body: OutboundCallIn, svc: Svc) -> CallDetail:
 
 
 @admin.post("/calls/test", status_code=201)
-async def place_test_call(body: TestCallIn, svc: Svc) -> CallDetail:
+async def place_test_call(body: TestCallIn, svc: Svc) -> CallDetail | DispatchOut:
     """Places one call right away from a persona snapshot instead of a stored agent_id: for the dashboard's
     "test outbound call" control, which has no campaign or published route to have created an agent yet."""
+    if body.idempotency_key:
+        # One lead, one attempt, no campaign mutation: the same queue supplies idempotency,
+        # pinned persona/voice, failure reporting and durable callbacks for a test call.
+        return await dispatch.accept(
+            svc,
+            DispatchIn(
+                idempotency_key=body.idempotency_key,
+                campaign_id=f"test-{body.idempotency_key}",
+                client_id=body.client_id,
+                persona=body.persona,
+                calling_window={"start": "00:00", "end": "23:59"},
+                retry_policy={"max_tries": 1, "retry_gap_minutes": 1, "callback_window_days": 1},
+                leads=[{"id": body.idempotency_key, "phone": body.to, "name": body.contact_name}],
+                webhook_url=body.webhook_url,
+                voice_id=body.voice_id,
+                tts_model_id=body.tts_model_id,
+            ),
+        )
     persona = body.persona
     speakable = AgentIn(
         **persona.model_dump(include=set(dispatch_db.PERSONA_FIELDS)),

@@ -148,6 +148,15 @@ class DispatchLead(_Camel):
     phone: str = Field(pattern=r"^\+?[0-9]{10,15}$")
     # The dashboard sends an em dash when a lead has no name.
     name: str | None = Field(None, max_length=100)
+    attempts: int = Field(0, ge=0, le=20)
+    next_attempt_at: datetime | None = None
+
+    @field_validator("next_attempt_at")
+    @classmethod
+    def _aware_attempt(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("nextAttemptAt must include a timezone")
+        return value
 
     @field_validator("name")
     @classmethod
@@ -224,13 +233,24 @@ class VoiceChoice(_Camel):
 
 
 class TestCallIn(VoiceChoice):
-    """One real outbound call, placed immediately: no campaign, no job, no webhook report. Used by the
-    dashboard's "test outbound call" control, which has a persona but no stored engine agent to call with."""
+    """One persona-pinned outbound test; Mona requests a durable, reported job with a request key.
+
+    Legacy management callers without that key keep the original immediate-call response.
+    """
 
     client_id: str = Field(min_length=1, max_length=64)
     persona: PersonaIn
     to: str = Field(pattern=r"^\+?[0-9]{10,15}$", description="Number to dial, e.g. +919876543210.")
     contact_name: str | None = Field(None, max_length=100)
+    # Mona opts into the existing durable dispatcher; legacy management clients still dial directly.
+    idempotency_key: str | None = Field(None, min_length=8, max_length=100)
+    webhook_url: str | None = Field(None, max_length=500)
+
+    @model_validator(mode="after")
+    def _reporting_pair(self) -> Self:
+        if bool(self.idempotency_key) != bool(self.webhook_url):
+            raise ValueError("idempotencyKey and webhookUrl must be supplied together")
+        return self
 
     @field_validator("contact_name")
     @classmethod
@@ -247,6 +267,15 @@ class DispatchIn(VoiceChoice):
     retry_policy: RetryPolicy
     leads: list[DispatchLead] = Field(min_length=1, max_length=5000)
     webhook_url: str = Field(max_length=500)
+    # A UTC instant. Existing next_attempt_at and the India calling window enforce both constraints.
+    not_before: datetime | None = None
+
+    @field_validator("not_before")
+    @classmethod
+    def _aware_start(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("notBefore must include a timezone")
+        return value
 
     @field_validator("webhook_url")
     @classmethod
@@ -261,6 +290,8 @@ class DispatchIn(VoiceChoice):
         ids = [lead.id for lead in self.leads]
         if len(set(ids)) != len(ids):
             raise ValueError("lead ids must be unique")
+        if any(lead.attempts >= self.retry_policy.max_tries for lead in self.leads):
+            raise ValueError("leads must have attempts remaining")
         return self
 
 

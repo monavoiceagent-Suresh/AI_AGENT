@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -290,16 +291,22 @@ async def place_outbound_call(
         raise CallRejected("Outbound calls are disabled (ENABLE_OUTBOUND_CALLS=false)")
     if not capacity_left(svc):
         raise CallRejected("Concurrent call limit reached")
+    # Reserve before the first await, including concurrent HTTP test/management requests.
+    reservation = f"placing-{uuid.uuid4()}"
+    svc.ringing[reservation] = time.monotonic()
     token = settings.exotel_webhook_secret.get_secret_value()
     callback = f"{settings.public_base_url.rstrip('/')}/exotel/status?token={token}"
     # A bare ten-digit or 0-prefixed number is an Indian one; Exotel needs the country code.
     number = f"+{digits}" if (digits := normalize_phone(number)) else number
-    call_sid = await svc.exotel.connect_to_flow(
-        number,
-        status_callback=callback,
-        time_limit=settings.max_call_duration_seconds,
-        ring_timeout=RING_TIMEOUT_SECONDS,
-    )
+    try:
+        call_sid = await svc.exotel.connect_to_flow(
+            number,
+            status_callback=callback,
+            time_limit=settings.max_call_duration_seconds,
+            ring_timeout=RING_TIMEOUT_SECONDS,
+        )
+    finally:
+        svc.ringing.pop(reservation, None)
     svc.ringing[call_sid] = time.monotonic()
     log.info("outbound call %s placed with agent %s", call_sid, agent.id)
     try:
@@ -321,8 +328,10 @@ async def place_outbound_call(
 
 
 async def call_status(svc: Services, call_sid: str, status: str) -> None:
-    svc.ringing.pop(call_sid, None)
     status = status.replace("-", "_")  # no-answer -> no_answer
+    if status not in {"completed", "failed", "busy", "no_answer", "canceled", "cancelled"}:
+        return
+    svc.ringing.pop(call_sid, None)
     if await db.apply_status_callback(svc.pool, call_sid, status):
         log.info("outbound call %s ended before connecting: %s", call_sid, status)
 
