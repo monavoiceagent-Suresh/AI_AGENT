@@ -1,0 +1,41 @@
+warning: in the working copy of 'Dockerfile', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/api.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/calls.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/config.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/dispatch.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/dispatch_db.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/inbound_db.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/main.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/models.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/voices.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docker-compose.yml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'pyproject.toml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/fakes.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_api.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_dispatch.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_inbound.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_outbound_dial.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_outbound_execution.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'uv.lock', LF will be replaced by CRLF the next time Git touches it
+ Dockerfile                       |   3 [32m+[m[31m-[m
+ app/api.py                       | 165 [32m+++++++++++++++++++++++++++++++++++++[m[31m--[m
+ app/calls.py                     |  97 [32m++++++++++++++[m[31m---------[m
+ app/config.py                    |  16 [32m++++[m
+ app/db.py                        |   8 [32m++[m
+ app/dispatch.py                  |  61 [32m+++++++++++++[m[31m--[m
+ app/dispatch_db.py               |  95 [32m++++++++++++++++[m[31m------[m
+ app/inbound_db.py                |  11 [32m++[m[31m-[m
+ app/main.py                      |  35 [32m++++++[m[31m---[m
+ app/models.py                    |  48 [32m++++++++++++[m
+ app/providers/exotel.py          |  63 [32m++++++++++++++[m[31m-[m
+ app/voices.py                    |  48 [32m++++++++++++[m
+ docker-compose.yml               |  19 [32m+++++[m
+ pyproject.toml                   |   2 [32m+[m
+ tests/fakes.py                   |  54 [32m+++++++++++++[m
+ tests/test_api.py                |  22 [32m++++++[m
+ tests/test_dispatch.py           |  29 [32m++++++[m[31m-[m
+ tests/test_inbound.py            |  38 [32m++[m[31m-------[m
+ tests/test_outbound_dial.py      |  27 [32m++++++[m[31m-[m
+ tests/test_outbound_execution.py | 120 [32m+++++++++++++++++++++[m[31m-------[m
+ uv.lock                          |  11 [32m+++[m
+ 21 files changed, 816 insertions(+), 156 deletions(-)

@@ -242,6 +242,14 @@ async def finish_call(
                 log.exception("call %s was saved but its report could not be queued", call_id)
 
 
+async def save_recording_url(pool: asyncpg.Pool, call_sid: str, url: str) -> None:
+    await pool.execute(
+        "UPDATE calls SET recording_url = $2 WHERE exotel_call_sid = $1 AND recording_url IS DISTINCT FROM $2",
+        call_sid,
+        url,
+    )
+
+
 async def apply_status_callback(pool: asyncpg.Pool, call_sid: str, status: str) -> bool:
     """Record a terminal Exotel status for calls whose media stream never connected."""
     result = await pool.execute(

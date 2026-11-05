@@ -2,14 +2,12 @@
 
 import json
 import logging
-from types import SimpleNamespace
 
 import asyncpg
 import pytest
 from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
 
-from app import calls
 from app.phone import normalize_phone
 from tests.fakes import exotel_start, make_settings
 from tests.test_api import ADMIN, APPOINTMENT_AGENT, EXOTEL_AUTH, client, converse  # noqa: F401
@@ -35,7 +33,9 @@ def route_body(**overrides) -> dict:
 
 
 def publish(client, **overrides):  # noqa: F811
-    return client.put("/inbound/routes", json=route_body(**overrides), headers=ADMIN)
+    body = route_body(**overrides)
+    client.put("/tenants", json={"id": body["clientId"], "name": "Test", "status": "active"}, headers=ADMIN)
+    return client.put("/inbound/routes", json=body, headers=ADMIN)
 
 
 def refused(client, call_sid: str, to_number: str) -> None:  # noqa: F811
@@ -242,32 +242,10 @@ def test_inbound_can_be_disabled_entirely(client):  # noqa: F811
 
 
 # ---- reserved capacity -----------------------------------------------------------------------
-
-
-def svc(**settings):
-    return SimpleNamespace(settings=make_settings(**settings), active_calls=0, ringing={})
-
-
-def test_outbound_calls_leave_the_reserved_slots_free():
-    service = svc(max_concurrent_calls=3, inbound_reserved_calls=1)
-    outcomes = []
-    for active in range(4):
-        service.active_calls = active
-        outcomes.append((calls.capacity_left(service), calls.capacity_left(service, inbound=True)))
-    assert outcomes == [(True, True), (True, True), (False, True), (False, False)]
-
-
-def test_ringing_calls_count_towards_capacity():
-    service = svc(max_concurrent_calls=2, inbound_reserved_calls=1)
-    service.ringing["CAx"] = 10**12  # far in the future: not pruned as expired
-    assert calls.capacity_left(service) is False and calls.capacity_left(service, inbound=True) is True
-
-
-def test_no_reservation_keeps_todays_behaviour():
-    service = svc(max_concurrent_calls=1)
-    assert calls.capacity_left(service) is True
-    service.active_calls = 1
-    assert calls.capacity_left(service) is False and calls.capacity_left(service, inbound=True) is False
+# Unit coverage of the admission logic itself (the inbound-reserved carve-out, concurrency,
+# duplicate reservations, stale-reservation sweep) now lives in tests/test_allocator.py, against
+# the real M2 ChannelAllocator. The tests below exercise the same business rule end to end,
+# through the actual API and dispatcher.
 
 
 def test_the_reservation_cannot_exceed_the_limit():
@@ -318,7 +296,7 @@ def test_the_slot_taken_while_an_inbound_call_is_set_up_is_released(client):  # 
     publish(client)
     converse(client, "CAin1", to_number=NUMBER)
     services = client.app.state.services
-    assert services.ringing == {} and services.active_calls == 0
+    assert client.portal.call(services.allocator.occupied) == 0
 
 
 # ---- a route that does not match the dialled number (the reported bug) ----------------------------

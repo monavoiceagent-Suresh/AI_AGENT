@@ -4,15 +4,19 @@ import json
 import logging
 import secrets
 import uuid
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import parse_qsl
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.background import BackgroundTask
 
-from app import calls, db, dispatch, dispatch_db, inbound, inbound_db, voices
+from app import calls, db, dispatch, dispatch_db, inbound, inbound_db, monitoring, tenants, voices
 from app.calls import CallRejected, Services
+from app.interfaces import TTSError
 from app.models import (
     Agent,
     AgentIn,
@@ -20,16 +24,20 @@ from app.models import (
     CallDetail,
     CallTurn,
     CancelOut,
+    CapacityOut,
     DispatchIn,
     DispatchOut,
     InboundRouteOut,
     InboundRoutePublishIn,
     JobOut,
     OutboundCallIn,
+    TenantOut,
+    TenantSyncIn,
     TestCallIn,
     UnroutedOut,
     VoicesOut,
 )
+from app.phone import normalize_phone
 from app.providers.exotel import ExotelError, ExotelMediaStream
 from app.redaction import redact
 
@@ -58,7 +66,14 @@ admin = APIRouter(dependencies=[Depends(require_admin)])
 @public.get("/health")
 async def health(svc: Svc) -> dict:
     await svc.pool.fetchval("SELECT 1")
-    return {"status": "ok", "active_calls": svc.active_calls, "outbound_dispatch_version": 1}
+    return {"status": "ok", "active_calls": await svc.allocator.occupied(), "outbound_dispatch_version": 1}
+
+
+@admin.get("/capacity")
+async def capacity(svc: Svc) -> CapacityOut:
+    """M3 Super Admin operational visibility: live occupancy, per-tenant breakdown, outbound
+    queue depth, and stale-allocation health counters. Read-only (see app/monitoring.py)."""
+    return await monitoring.capacity_snapshot(svc.pool, svc.settings, svc.allocator)
 
 
 # ---- agents ---------------------------------------------------------------------------
@@ -95,6 +110,17 @@ async def list_agents(svc: Svc) -> list[Agent]:
     return [Agent(**dict(r)) for r in await db.list_agents(svc.pool)]
 
 
+@admin.post("/voices/preview")
+async def voice_preview(svc: Svc, voice_id: Annotated[str, Query(pattern=r"^[A-Za-z0-9_-]{1,128}$")]) -> Response:
+    try:
+        audio = await voices.preview_voice(svc, voice_id)
+    except (voices.VoicesUnavailable, TTSError, TimeoutError, httpx.HTTPError, OSError, ValueError) as exc:
+        raise HTTPException(502, "Voice preview is unavailable") from exc
+    if audio is None:
+        raise HTTPException(404, "Voice is no longer available")
+    return Response(audio, media_type="audio/wav", headers={"Cache-Control": "no-store"})
+
+
 @admin.get("/agents/{agent_id}")
 async def get_agent(agent_id: int, svc: Svc) -> Agent:
     record = await db.get_agent(svc.pool, agent_id)
@@ -114,6 +140,24 @@ async def update_agent(agent_id: int, agent: AgentIn, svc: Svc) -> Agent:
     return Agent(**dict(record))
 
 
+# ---- tenants (synced by the Mona dashboard; see app/tenants.py) -------------------------------
+
+
+@admin.put("/tenants")
+async def sync_tenant(body: TenantSyncIn, svc: Svc) -> TenantOut:
+    """Idempotent upsert of one tenant's identity, so the engine can validate client_id elsewhere."""
+    await tenants.upsert_tenant(svc.pool, body.id, body.name, body.status)
+    return TenantOut(id=body.id, name=body.name, status=body.status)
+
+
+@admin.get("/tenants/{tenant_id}")
+async def get_tenant(tenant_id: str, svc: Svc) -> TenantOut:
+    row = await tenants.get_tenant(svc.pool, tenant_id)
+    if row is None:
+        raise HTTPException(404, "Tenant not found")
+    return TenantOut(id=row["id"], name=row["name"], status=row["status"])
+
+
 # ---- inbound routing (published by the Mona dashboard) ---------------------------------------
 
 
@@ -121,7 +165,12 @@ async def update_agent(agent_id: int, agent: AgentIn, svc: Svc) -> Agent:
 async def publish_inbound_route(body: InboundRoutePublishIn, svc: Svc) -> InboundRouteOut:
     """Publish (or replace) the persona that answers one dialled number. Versions must increase."""
     try:
+        await tenants.require_known(svc, body.client_id, context="inbound route publish")
         return await inbound.publish(svc, body)
+    except tenants.TenantNotRecognized as exc:
+        raise HTTPException(404, {"code": "tenant_not_recognized", "message": str(exc)}) from exc
+    except tenants.TenantSuspended as exc:
+        raise HTTPException(403, {"code": "tenant_suspended", "message": str(exc)}) from exc
     except inbound_db.StaleVersion as exc:
         raise HTTPException(409, {"code": "stale_version", "currentVersion": exc.current}) from exc
     except inbound_db.VersionConflict as exc:
@@ -146,6 +195,32 @@ async def list_unrouted_numbers(svc: Svc) -> list[UnroutedOut]:
         )
         for row in await inbound_db.list_unrouted(svc.pool)
     ]
+
+
+@admin.delete("/inbound/routes/{phone}")
+async def revoke_inbound_route(phone: str, client_id: str, svc: Svc, minimum_version: int = 0) -> dict:
+    from app.phone import normalize_phone
+
+    normalized = normalize_phone(phone)
+    if not normalized:
+        raise HTTPException(422, "Invalid phone")
+    async with svc.pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", normalized)
+        await conn.execute(
+            "UPDATE inbound_routes SET active = false, version = GREATEST(version + 1, $3) "
+            "WHERE phone = $1 AND client_id = $2",
+            normalized,
+            client_id,
+            minimum_version,
+        )
+        # Caller IDs are job snapshots. Revocation must also stop future calls using that snapshot.
+        await conn.execute(
+            "UPDATE dispatch_jobs SET status = 'cancelled' WHERE client_id = $1 "
+            "AND caller_id = $2 AND status IN ('queued', 'running')",
+            client_id,
+            f"+{normalized}",
+        )
+    return {"ok": True}
 
 
 @admin.get("/inbound/routes/{phone}")
@@ -194,8 +269,14 @@ async def place_call(body: OutboundCallIn, svc: Svc) -> CallDetail:
     record = await db.get_agent(svc.pool, body.agent_id)
     if record is None:
         raise HTTPException(404, "Agent not found")
+    agent = Agent(**dict(record))
     try:
-        call_id = await calls.place_outbound_call(svc, Agent(**dict(record)), body.to, body.contact_name)
+        await tenants.require_known(svc, agent.client_id, context="ad-hoc outbound call")
+        call_id = await calls.place_outbound_call(svc, agent, body.to, body.contact_name)
+    except tenants.TenantNotRecognized as exc:
+        raise HTTPException(404, {"code": "tenant_not_recognized", "message": str(exc)}) from exc
+    except tenants.TenantSuspended as exc:
+        raise HTTPException(403, {"code": "tenant_suspended", "message": str(exc)}) from exc
     except CallRejected as exc:
         raise HTTPException(409, str(exc)) from exc
     except ExotelError as exc:
@@ -233,6 +314,12 @@ async def place_test_call(body: TestCallIn, svc: Svc) -> CallDetail | DispatchOu
     )
     if problem := calls.validate_agent(speakable, svc.settings):
         raise HTTPException(422, f"Persona {persona.key!r} cannot be spoken by the voice engine: {problem}")
+    try:
+        await tenants.require_known(svc, body.client_id, context="ad-hoc test call")
+    except tenants.TenantNotRecognized as exc:
+        raise HTTPException(404, {"code": "tenant_not_recognized", "message": str(exc)}) from exc
+    except tenants.TenantSuspended as exc:
+        raise HTTPException(403, {"code": "tenant_suspended", "message": str(exc)}) from exc
     async with svc.pool.acquire() as conn:
         agent_id = await dispatch_db.upsert_persona_agent(conn, body.client_id, persona)
     agent = Agent(**dict(await db.get_agent(svc.pool, agent_id)))
@@ -261,6 +348,56 @@ async def get_call(call_id: int, svc: Svc) -> CallDetail:
     return CallDetail(**dict(call), turns=[CallTurn(**dict(t)) for t in turns])
 
 
+@admin.post("/calls/{call_id}/recording")
+async def call_recording(
+    call_id: int,
+    svc: Svc,
+    client_id: Annotated[str, Body()],
+    direction: Annotated[Literal["inbound", "outbound"], Body()],
+    dialled_number: Annotated[str, Body()],
+) -> StreamingResponse:
+    row = await svc.pool.fetchrow(
+        "SELECT c.exotel_call_sid, c.recording_url, c.direction, c.to_number, c.dialled_number, a.client_id "
+        "FROM calls c JOIN agents a ON a.id = c.agent_id WHERE c.id = $1",
+        call_id,
+    )
+    expected_number = normalize_phone(dialled_number)
+    if (
+        not row
+        or not row["exotel_call_sid"]
+        or row["client_id"] != client_id
+        or row["direction"] != direction
+        or not expected_number
+        or expected_number != normalize_phone(row["dialled_number"] or row["to_number"])
+    ):
+        raise HTTPException(404, "Recording unavailable")
+
+    sid = row["exotel_call_sid"]
+    stored_url = row["recording_url"]
+    try:
+        audio = await svc.exotel.open_recording(stored_url) if stored_url else None
+        if audio is None:
+            stable_url, signed_url = await svc.exotel.recording_urls(sid)
+            if stable_url and stable_url != stored_url and len(stable_url) <= 4096:
+                await db.save_recording_url(svc.pool, sid, stable_url)
+            if signed_url:
+                audio = await svc.exotel.open_recording(signed_url)
+            if audio is None and stable_url and stable_url != stored_url:
+                audio = await svc.exotel.open_recording(stable_url)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        # Provider errors can include signed URLs. Return a generic response without logging them.
+        raise HTTPException(502, "Recording could not be loaded") from None
+    if audio is None:
+        raise HTTPException(404, "Recording unavailable")
+    content_type = audio.headers.get("content-type", "").split(";", 1)[0].lower()
+    return StreamingResponse(
+        audio.aiter_bytes(),
+        media_type=content_type if content_type.startswith("audio/") else "audio/mpeg",
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+        background=BackgroundTask(audio.aclose),
+    )
+
+
 # ---- Exotel ---------------------------------------------------------------------------
 
 
@@ -270,14 +407,26 @@ async def exotel_status(request: Request, svc: Svc, token: str = "") -> dict:
     expected = svc.settings.exotel_webhook_secret.get_secret_value()
     if not secrets.compare_digest(token.encode(), expected.encode()):
         raise HTTPException(403, "Invalid token")
-    if request.headers.get("content-type", "").startswith("application/json"):
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type == "application/json":
         payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(422, "CallSid and Status are required")
+    elif content_type == "multipart/form-data":
+        async with request.form() as form:
+            payload = dict(form)
     else:
         payload = dict(parse_qsl((await request.body()).decode()))
     call_sid, status = payload.get("CallSid"), payload.get("Status")
-    if not call_sid or not status:
+    if not isinstance(call_sid, str) or not call_sid.strip() or not isinstance(status, str) or not status.strip():
         raise HTTPException(422, "CallSid and Status are required")
-    await calls.call_status(svc, str(call_sid), str(status))
+    recording_url = payload.get("RecordingUrl")
+    await calls.call_status(
+        svc,
+        call_sid.strip(),
+        status.strip().lower(),
+        recording_url.strip() if isinstance(recording_url, str) and len(recording_url) <= 4096 else None,
+    )
     return {"ok": True}
 
 

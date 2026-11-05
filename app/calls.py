@@ -4,10 +4,9 @@ import asyncio
 import logging
 import sys
 import time
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
@@ -15,12 +14,13 @@ import asyncpg
 import httpx
 
 from app import db, dispatch_db, inbound_db, metrics, prompts
+from app.allocator import ChannelAllocator, new_allocation_id
 from app.config import ASRProvider, Settings, TTSProvider
 from app.interfaces import ASR, LLM, TTS, LLMUsage, Transcriber, Voice
 from app.models import BAKBAK_MODELS, TTS_MODEL_LANGUAGES, Agent, AgentIn, OutcomeRuleIn
 from app.phone import normalize_phone
 from app.providers.budget import BudgetedLLM
-from app.providers.exotel import ExotelClient, ExotelMediaStream, StreamStart
+from app.providers.exotel import ExotelClient, ExotelError, ExotelMediaStream, StreamStart
 from app.redaction import mask_number
 from app.session import SessionConfig, VoiceSession
 
@@ -37,9 +37,9 @@ TTS_PROVIDER_LANGUAGES: dict[TTSProvider, set[str] | None] = {
 }
 
 
-# Exotel rings the callee for this long; an unanswered reservation expires shortly after.
+# Exotel rings the callee for this long; an unanswered reservation expires shortly after
+# (Settings.allocation_reservation_seconds, enforced inside the allocator's own Lua script).
 RING_TIMEOUT_SECONDS = 45
-RESERVATION_SECONDS = 90
 # Pause before the second read of Exotel's record of a call that has only just connected.
 LOOKUP_RETRY_SECONDS = 0.5
 
@@ -64,9 +64,9 @@ class Services:
     tts: TTS
     fallback_tts: TTS | None
     tts_by_provider: dict[TTSProvider, "TTS | None"]
-    active_calls: int = 0
-    # Outbound CallSid -> time placed, holding capacity until the call connects or ends.
-    ringing: dict[str, float] = field(default_factory=dict)
+    # M2: the account-wide concurrent-channel budget (app/allocator.py). Replaces the old
+    # per-process active_calls/ringing counters entirely — there is no in-memory fallback.
+    allocator: ChannelAllocator
 
 
 def _elevenlabs_model_id(provider: TTSProvider, settings: Settings) -> str:
@@ -239,17 +239,6 @@ def session_config(agent: Agent, settings: Settings, caller_context: str) -> Ses
     )
 
 
-def capacity_left(svc: Services, *, inbound: bool = False) -> bool:
-    """Whether one more call fits. Outbound and campaign calls leave INBOUND_RESERVED_CALLS slots free."""
-    now = time.monotonic()
-    for call_sid, placed in list(svc.ringing.items()):
-        if now - placed > RESERVATION_SECONDS:
-            del svc.ringing[call_sid]
-    settings = svc.settings
-    limit = settings.max_concurrent_calls - (0 if inbound else settings.inbound_reserved_calls)
-    return svc.active_calls + len(svc.ringing) < limit
-
-
 def with_call_voice(agent: Agent, voice_id: str | None, tts_model_id: str | None) -> Agent:
     """The voice this call was placed with, on its own copy of the agent; the agent's voice when none was chosen."""
     if not (voice_id and tts_model_id):
@@ -285,36 +274,54 @@ async def place_outbound_call(
     *,
     voice_id: str | None = None,
     tts_model_id: str | None = None,
+    caller_id: str | None = None,
 ) -> int:
+    from app import tenants
+
+    try:
+        await tenants.require_known(svc, agent.client_id, context="outbound admission", enforce=True)
+    except (tenants.TenantNotRecognized, tenants.TenantSuspended) as exc:
+        raise CallRejected(str(exc)) from exc
     settings = svc.settings
     if not settings.enable_outbound_calls:
         raise CallRejected("Outbound calls are disabled (ENABLE_OUTBOUND_CALLS=false)")
-    if not capacity_left(svc):
+    # Reserve before the first await, including concurrent HTTP test/management requests: the
+    # Redis Lua script makes this one atomic admission decision, so two concurrent calls to this
+    # function (even from different engine processes sharing the same Redis) can never both win
+    # the last slot.
+    allocation_id = new_allocation_id()
+    if not await svc.allocator.reserve(
+        allocation_id, "outbound", client_id=agent.client_id, dispatch_lead_id=dispatch_lead_id
+    ):
         raise CallRejected("Concurrent call limit reached")
-    # Reserve before the first await, including concurrent HTTP test/management requests.
-    reservation = f"placing-{uuid.uuid4()}"
-    svc.ringing[reservation] = time.monotonic()
     token = settings.exotel_webhook_secret.get_secret_value()
     callback = f"{settings.public_base_url.rstrip('/')}/exotel/status?token={token}"
     # A bare ten-digit or 0-prefixed number is an Indian one; Exotel needs the country code.
     number = f"+{digits}" if (digits := normalize_phone(number)) else number
+    # The tenant's own resolved, validated caller ID (M1 number inventory), snapshotted on the
+    # dispatch job; None (not yet migrated, or an ad-hoc call) falls back to the engine-wide default.
+    resolved_caller_id = caller_id or settings.exotel_caller_id
     try:
         call_sid = await svc.exotel.connect_to_flow(
             number,
             status_callback=callback,
             time_limit=settings.max_call_duration_seconds,
             ring_timeout=RING_TIMEOUT_SECONDS,
+            caller_id=resolved_caller_id,
         )
-    finally:
-        svc.ringing.pop(reservation, None)
-    svc.ringing[call_sid] = time.monotonic()
+    except Exception as exc:
+        # A timeout or unreadable response may hide a successfully placed call.
+        if isinstance(exc, ExotelError) and not exc.placement_unknown:
+            await svc.allocator.release(allocation_id)
+        raise
+    await svc.allocator.set_call_sid(allocation_id, call_sid)
     log.info("outbound call %s placed with agent %s", call_sid, agent.id)
     try:
         return await db.create_outbound_call(
             svc.pool,
             agent.id,
             call_sid,
-            settings.exotel_caller_id,
+            resolved_caller_id,
             number,
             contact_name,
             dispatch_lead_id,
@@ -327,13 +334,18 @@ async def place_outbound_call(
         raise
 
 
-async def call_status(svc: Services, call_sid: str, status: str) -> None:
+async def call_status(svc: Services, call_sid: str, status: str, recording_url: str | None = None) -> None:
     status = status.replace("-", "_")  # no-answer -> no_answer
     if status not in {"completed", "failed", "busy", "no_answer", "canceled", "cancelled"}:
         return
-    svc.ringing.pop(call_sid, None)
+    # Idempotent: a duplicate delivery of the same terminal callback (Exotel does not guarantee
+    # exactly-once webhooks) releases an already-released allocation harmlessly. If the call did
+    # connect, this is a no-op here too — run_call's own finally already released it.
+    await svc.allocator.release_by_call_sid(call_sid)
     if await db.apply_status_callback(svc.pool, call_sid, status):
         log.info("outbound call %s ended before connecting: %s", call_sid, status)
+    if recording_url:
+        await db.save_recording_url(svc.pool, call_sid, recording_url)
 
 
 class Resolved(NamedTuple):
@@ -351,7 +363,6 @@ async def resolve_agent(svc: Services, start: StreamStart) -> Resolved:
     if call is not None:
         if call["status"] != "initiated":
             raise CallRejected(f"Call {start.call_sid} was already handled")
-        svc.ringing.pop(start.call_sid, None)
         agent = Agent(**dict(await db.get_agent(svc.pool, call["agent_id"])))
         campaign_id = None
         if call["dispatch_lead_id"] is not None:
@@ -460,10 +471,23 @@ async def _resolve_inbound(svc: Services, start: StreamStart) -> Resolved:
         if record is None:
             raise CallRejected(f"No inbound route is published for the dialled number {start.to_number!r}")
         agent = Agent(**dict(record))
-    if not capacity_left(svc, inbound=True):
+    from app import tenants
+
+    try:
+        await tenants.require_known(svc, agent.client_id, context="inbound admission", enforce=True)
+    except (tenants.TenantNotRecognized, tenants.TenantSuspended) as exc:
+        raise CallRejected(str(exc)) from exc
+    # Using the call_sid itself as the allocation id (it is already unique and known) makes this
+    # naturally idempotent against a duplicate/retried stream-start for the same call: a second
+    # attempt finds its own id already reserved and is granted again rather than double-counted.
+    if not await svc.allocator.reserve(
+        start.call_sid,
+        "inbound",
+        call_sid=start.call_sid,
+        client_id=agent.client_id,
+        route_phone=route["phone"] if route is not None else None,
+    ):
         raise CallRejected("Concurrent call limit reached")
-    # Hold the slot until run_call counts the call, so a campaign cannot take it in between.
-    svc.ringing[start.call_sid] = time.monotonic()
     return Resolved(agent, None, prompts.caller_context("inbound", None), replace(start, called_number=routed_by))
 
 
@@ -496,8 +520,9 @@ async def run_call(
     log.info("call %s connected (agent %s, %s Hz)", call_id, agent.id, media.sample_rate)
     session: VoiceSession | None = None
     cancelled = False
-    svc.ringing.pop(start.call_sid, None)  # the slot held while this call was being set up
-    svc.active_calls += 1
+    # Reserved -> Connected: still holds its slot (mark_connected only clears the reservation's
+    # time limit), so total occupancy does not change here — only how this allocation is counted.
+    await svc.allocator.mark_connected_by_call_sid(start.call_sid)
     # Fresh per call: it only caps this one call's own requests, on top of each provider's own shared throttle.
     call_llm = BudgetedLLM(svc.llm, max_requests=settings.llm_max_requests_per_call, call_sid=start.call_sid)
     try:
@@ -514,7 +539,7 @@ async def run_call(
         log.exception("call %s failed", call_id)
         end_reason = f"error:{type(exc).__name__}"
     finally:
-        svc.active_calls -= 1
+        # Closing media does not confirm provider termination.
         await media.close()
 
     # Persist in a separate task so a cancelled handler cannot abort the write half-way.

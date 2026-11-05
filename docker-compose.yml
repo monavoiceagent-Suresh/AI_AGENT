@@ -17,16 +17,35 @@ services:
       timeout: 3s
       retries: 15
 
+  # M2 channel allocator: the durable fast-path store for atomic reservations (app/allocator.py).
+  # A single instance is fine for a single engine process; the allocator's Lua scripts are the
+  # part designed to stay correct once more than one engine instance shares this same Redis.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   app:
     build: .
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "${PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  redisdata:

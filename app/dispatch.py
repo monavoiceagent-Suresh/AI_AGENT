@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from app import calls, db, dispatch_db
+from app import calls, db, dispatch_db, tenants
 from app.calls import CallRejected, Services
 from app.models import Agent, AgentIn, DispatchIn, DispatchOut
 from app.providers.exotel import ExotelError
@@ -48,6 +48,12 @@ async def accept(svc: Services, request: DispatchIn) -> DispatchOut:
         return _rejected("DASHBOARD_WEBHOOK_SECRET is not configured on the voice engine")
     if not svc.settings.enable_outbound_calls:
         return _rejected("Outbound calls are disabled on the voice engine (ENABLE_OUTBOUND_CALLS=false)")
+    try:
+        await tenants.require_known(svc, request.client_id, context="campaign dispatch")
+    except tenants.TenantNotRecognized as exc:
+        return _rejected(str(exc))
+    except tenants.TenantSuspended as exc:
+        return _rejected(str(exc))
     persona = request.persona
     speakable = AgentIn(
         **persona.model_dump(include=set(dispatch_db.PERSONA_FIELDS)),
@@ -93,7 +99,7 @@ async def settle_attempt(
     data: dict[str, Any] = {
         "leadId": attempt["lead_id"],
         "leadPhone": attempt["phone"],
-        "callerNumber": svc.settings.exotel_caller_id,
+        "callerNumber": attempt.get("caller_id") or svc.settings.exotel_caller_id,
         "outcome": outcome,
         "durationSeconds": round(seconds),
         "attempt": attempt["attempts"],
@@ -123,10 +129,31 @@ async def settle_attempt(
     )
 
 
+_TERMINAL_EXOTEL_STATUSES = frozenset({"completed", "failed", "busy", "no-answer", "canceled", "cancelled"})
+
+
 async def abandon_stale_calls(svc: Services) -> None:
-    abandoned = await dispatch_db.abandon_stale_calls(
+    """Abandon only calls for which Exotel confirms a terminal state."""
+    candidates = await dispatch_db.candidate_stale_calls(
         svc.pool, RINGING_GRACE_SECONDS, svc.settings.max_call_duration_seconds + CONNECTED_GRACE_SECONDS
     )
+    abandoned = 0
+    for row in candidates:
+        call_sid = row["exotel_call_sid"]
+        still_live = False
+        if call_sid:
+            try:
+                record = await svc.exotel.get_call_record(call_sid, wait_seconds=5.0)
+                still_live = record.status.lower() not in _TERMINAL_EXOTEL_STATUSES
+            except Exception:
+                log.warning("could not confirm stale call %s; retaining it", call_sid)
+                continue
+        if not call_sid or still_live:
+            continue
+        await dispatch_db.finalize_abandoned_call(svc.pool, row["id"])
+        if call_sid:
+            await svc.allocator.release_by_call_sid(call_sid)
+        abandoned += 1
     released = await dispatch_db.release_unplaced_claims(svc.pool, UNPLACED_CLAIM_SECONDS)
     if abandoned or released:
         log.warning("dispatcher recovered %d stale call(s) and %d unplaced claim(s)", abandoned, released)
@@ -150,8 +177,13 @@ async def settle_finished_calls(svc: Services) -> None:
 
 
 async def place_next_call(svc: Services) -> bool:
-    """Start the next due call if there is capacity. Returns whether a lead was taken."""
-    if not svc.settings.enable_outbound_calls or not calls.capacity_left(svc):
+    """Start the next due call if there is capacity. Returns whether a lead was taken.
+
+    Capacity itself is checked atomically inside place_outbound_call (the M2 allocator); a lead
+    claimed when the account is full is simply released again via the existing CallRejected path
+    below, exactly as it already was for any other reason place_outbound_call might refuse.
+    """
+    if not svc.settings.enable_outbound_calls:
         return False
     lead = await dispatch_db.next_due_lead(svc.pool)
     if lead is None or not await dispatch_db.claim_lead(svc.pool, lead["lead_pk"]):
@@ -167,6 +199,7 @@ async def place_next_call(svc: Services) -> bool:
             lead["lead_pk"],
             voice_id=lead["voice_id"],
             tts_model_id=lead["tts_model_id"],
+            caller_id=lead.get("caller_id"),
         )
     except CallRejected:
         await dispatch_db.release_lead(svc.pool, lead["lead_pk"])
@@ -177,7 +210,10 @@ async def place_next_call(svc: Services) -> bool:
         await settle_attempt(
             svc,
             {**attempt, "max_tries": attempt["attempts"]} if unknown else attempt,
-            call_id=None, connected=False, outcome="placement_unknown" if unknown else "dial_failed", seconds=0.0,
+            call_id=None,
+            connected=False,
+            outcome="placement_unknown" if unknown else "dial_failed",
+            seconds=0.0,
         )
         return True
     await dispatch_db.mark_job_running(svc.pool, lead["job_id"])
@@ -193,7 +229,7 @@ async def place_next_call(svc: Services) -> bool:
                 "engineCallId": str(call_id),
                 "leadId": lead["lead_id"],
                 "leadPhone": lead["phone"],
-                "callerNumber": svc.settings.exotel_caller_id,
+                "callerNumber": lead.get("caller_id") or svc.settings.exotel_caller_id,
             },
         },
     )
@@ -289,4 +325,13 @@ async def _repeat(svc: Services, step: Callable[[Services], Awaitable[None]]) ->
 async def run_forever(svc: Services) -> None:
     """Places calls and settles results in one loop, and delivers webhooks in another so that a slow
     dashboard can delay neither dialling nor the saving of a call."""
-    await asyncio.gather(_repeat(svc, tick), _repeat(svc, deliver_webhooks))
+
+    async def reconcile():
+        while True:
+            try:
+                await svc.allocator.reconcile_on_startup(svc.exotel)
+            except Exception:
+                log.exception("allocator reconciliation failed; admissions remain conservative")
+            await asyncio.sleep(30)
+
+    await asyncio.gather(_repeat(svc, tick), _repeat(svc, deliver_webhooks), reconcile())

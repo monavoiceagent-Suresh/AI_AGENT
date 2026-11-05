@@ -92,8 +92,8 @@ async def create_job(pool: asyncpg.Pool, request: DispatchIn) -> str:
             agent_id = await upsert_persona_agent(conn, request.client_id, request.persona)
             job_id = await conn.fetchval(
                 "INSERT INTO dispatch_jobs (idempotency_key, client_id, campaign_id, agent_id, status, window_start, "
-                "window_end, max_tries, retry_gap_minutes, webhook_url, persona, voice_id, tts_model_id) "
-                "VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
+                "window_end, max_tries, retry_gap_minutes, webhook_url, persona, voice_id, tts_model_id, caller_id) "
+                "VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
                 request.idempotency_key,
                 request.client_id,
                 request.campaign_id,
@@ -106,13 +106,17 @@ async def create_job(pool: asyncpg.Pool, request: DispatchIn) -> str:
                 request.persona.model_dump(),
                 request.voice_id,
                 request.tts_model_id,
+                request.caller_id,
             )
             await conn.executemany(
                 "INSERT INTO dispatch_leads (job_id, lead_id, phone, name, next_attempt_at, attempts) "
                 "VALUES ($1, $2, $3, $4, COALESCE($5, now()), $6)",
                 [
                     (
-                        job_id, lead.id, lead.phone, lead.name,
+                        job_id,
+                        lead.id,
+                        lead.phone,
+                        lead.name,
                         max((d for d in (request.not_before, lead.next_attempt_at) if d is not None), default=None),
                         lead.attempts,
                     )
@@ -152,24 +156,39 @@ async def cancel_job(pool: asyncpg.Pool, job_id: str) -> str | None:
 
 
 async def next_due_lead(pool: asyncpg.Pool) -> asyncpg.Record | None:
-    """The next lead to call: due, its job open, and the current India time inside the job's calling window."""
+    """Choose the least-loaded tenant, then the least recently served tenant.
+
+    Persistent service history prevents oldest-backlog starvation when loads return to zero.
+    The dispatcher remains single-owner; claim_lead uses compare-and-set for duplicate claims.
+    """
     return await pool.fetchrow(
+        "WITH tenant_load AS ("
+        "    SELECT j2.client_id, count(*) AS in_flight FROM dispatch_leads l2 "
+        "    JOIN dispatch_jobs j2 ON j2.id = l2.job_id WHERE l2.status = 'calling' GROUP BY j2.client_id"
+        ") "
         "SELECT l.id AS lead_pk, l.lead_id, l.phone, l.name, l.attempts, j.id AS job_id, j.status AS job_status, "
-        "j.agent_id, j.max_tries, j.retry_gap_minutes, j.voice_id, j.tts_model_id "
+        "j.agent_id, j.max_tries, j.retry_gap_minutes, j.voice_id, j.tts_model_id, j.caller_id "
         "FROM dispatch_leads l JOIN dispatch_jobs j ON j.id = l.job_id "
+        "LEFT JOIN tenant_load t ON t.client_id = j.client_id "
+        "JOIN tenants tenant ON tenant.id = j.client_id AND tenant.status = 'active' "
         "WHERE l.status = 'pending' AND l.next_attempt_at <= now() AND j.status IN ('queued', 'running') "
         "AND l.attempts < j.max_tries "
         "AND to_char(now() AT TIME ZONE 'Asia/Kolkata', 'HH24:MI') BETWEEN j.window_start AND j.window_end "
-        "ORDER BY l.next_attempt_at, l.id LIMIT 1"
+        "ORDER BY COALESCE(t.in_flight, 0) ASC, "
+        "(SELECT max(j3.last_served_at) FROM dispatch_jobs j3 WHERE j3.client_id = j.client_id) ASC NULLS FIRST, "
+        "l.next_attempt_at ASC, l.id ASC LIMIT 1"
     )
 
 
 async def claim_lead(pool: asyncpg.Pool, lead_pk: int) -> bool:
-    claimed = await pool.fetchval(
-        "UPDATE dispatch_leads SET status = 'calling', attempts = attempts + 1, claimed_at = now() "
-        "WHERE id = $1 AND status = 'pending' RETURNING id",
-        lead_pk,
-    )
+    async with pool.acquire() as conn, conn.transaction():
+        claimed = await conn.fetchval(
+            "UPDATE dispatch_leads SET status = 'calling', attempts = attempts + 1, claimed_at = now() "
+            "WHERE id = $1 AND status = 'pending' RETURNING job_id",
+            lead_pk,
+        )
+        if claimed is not None:
+            await conn.execute("UPDATE dispatch_jobs SET last_served_at = clock_timestamp() WHERE id = $1", claimed)
     return claimed is not None
 
 
@@ -189,17 +208,33 @@ async def mark_job_running(pool: asyncpg.Pool, job_id: Any) -> None:
 # ---- reconciling finished calls --------------------------------------------------------------
 
 
-async def abandon_stale_calls(pool: asyncpg.Pool, ringing_seconds: int, connected_seconds: int) -> int:
-    """Close dispatch calls that never reported back (lost status callback, engine restarted mid-call)."""
-    result = await pool.execute(
-        "UPDATE calls SET status = 'abandoned', end_reason = 'dispatcher_timeout', ended_at = now() "
-        "WHERE dispatch_lead_id IS NOT NULL AND ("
+async def candidate_stale_calls(
+    pool: asyncpg.Pool, ringing_seconds: int, connected_seconds: int
+) -> list[asyncpg.Record]:
+    """Dispatch calls that have gone quiet for longer than a status callback should ever take
+    (lost callback, engine restarted mid-call). M3: a SELECT only — the caller (dispatch.py)
+    confirms each one with Exotel's own record before declaring it abandoned, so a call that is
+    genuinely still connected is never released just because its callback was merely slow
+    ("release allocations only on confirmed terminal states").
+    """
+    return await pool.fetch(
+        "SELECT id, exotel_call_sid FROM calls WHERE dispatch_lead_id IS NOT NULL AND ("
         "(status = 'initiated' AND created_at < now() - make_interval(secs => $1)) OR "
         "(status = 'in_progress' AND started_at < now() - make_interval(secs => $2)))",
         ringing_seconds,
         connected_seconds,
     )
-    return int(result.split()[-1])
+
+
+async def finalize_abandoned_call(pool: asyncpg.Pool, call_id: int) -> None:
+    """Closes one call confirmed (or unconfirmable — see dispatch.py) abandoned. Guarded by
+    status: a call that reported back normally between the candidate scan and this call is left
+    alone, never overwritten."""
+    await pool.execute(
+        "UPDATE calls SET status = 'abandoned', end_reason = 'dispatcher_timeout', ended_at = now() "
+        "WHERE id = $1 AND status IN ('initiated', 'in_progress')",
+        call_id,
+    )
 
 
 async def release_unplaced_claims(pool: asyncpg.Pool, older_than_seconds: int) -> int:
@@ -213,14 +248,24 @@ async def release_unplaced_claims(pool: asyncpg.Pool, older_than_seconds: int) -
             older_than_seconds,
         )
         for row in rows:
-            await enqueue_event(conn, row["job_id"], {
-                "eventId": str(uuid.uuid4()), "eventType": "call.failed",
-                "engineJobId": str(row["job_id"]), "occurredAt": datetime.now(UTC).isoformat(),
-                "data": {
-                    "leadId": row["lead_id"], "leadPhone": row["phone"], "attempt": row["attempts"],
-                    "outcome": "placement_unknown", "durationSeconds": 0, "leadState": "exhausted",
+            await enqueue_event(
+                conn,
+                row["job_id"],
+                {
+                    "eventId": str(uuid.uuid4()),
+                    "eventType": "call.failed",
+                    "engineJobId": str(row["job_id"]),
+                    "occurredAt": datetime.now(UTC).isoformat(),
+                    "data": {
+                        "leadId": row["lead_id"],
+                        "leadPhone": row["phone"],
+                        "attempt": row["attempts"],
+                        "outcome": "placement_unknown",
+                        "durationSeconds": 0,
+                        "leadState": "exhausted",
+                    },
                 },
-            })
+            )
     return len(rows)
 
 
@@ -228,7 +273,7 @@ async def finished_attempts(pool: asyncpg.Pool) -> list[asyncpg.Record]:
     """Leads in 'calling' whose latest call has ended."""
     return await pool.fetch(
         "SELECT l.id AS lead_pk, l.lead_id, l.phone, l.attempts, j.id AS job_id, j.status AS job_status, "
-        "j.max_tries, j.retry_gap_minutes, c.id AS call_id, c.status AS call_status, c.outcome, "
+        "j.max_tries, j.retry_gap_minutes, j.caller_id, c.id AS call_id, c.status AS call_status, c.outcome, "
         "c.connected_seconds::float8 AS connected_seconds "
         "FROM dispatch_leads l JOIN dispatch_jobs j ON j.id = l.job_id "
         "JOIN calls c ON c.dispatch_lead_id = l.id "

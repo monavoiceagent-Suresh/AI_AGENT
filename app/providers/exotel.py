@@ -7,11 +7,13 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 from fastapi import WebSocket, WebSocketDisconnect
@@ -42,6 +44,10 @@ class ExotelCallRecord:
     phone_number_sid: str
     direction: str
     forwarded_from: str
+    # Exotel's own call status (e.g. "in-progress", "completed", "busy", "no-answer", "failed");
+    # used by the M2 channel allocator (app/allocator.py) to decide, on restart, whether a call a
+    # reservation still refers to is actually still live. "" on older/incomplete records.
+    status: str = ""
 
 
 class ExotelClient:
@@ -78,10 +84,61 @@ class ExotelClient:
             phone_number_sid=str(call.get("PhoneNumberSid") or ""),
             direction=str(call.get("Direction") or ""),
             forwarded_from=str(call.get("ForwardedFrom") or ""),
+            status=str(call.get("Status") or ""),
         )
 
-    async def connect_to_flow(self, number: str, *, status_callback: str, time_limit: int, ring_timeout: int) -> str:
-        """Dial `number` and, once answered, run the App Bazaar flow. Returns the Exotel CallSid."""
+    async def open_recording(self, url: str) -> httpx.Response | None:
+        """Open audio from Exotel or S3. Recheck redirects before forwarding any credentials."""
+        for _ in range(4):
+            parsed = urlsplit(url)
+            if parsed.scheme != "https" or parsed.username is not None or parsed.password is not None:
+                return None
+            host = parsed.hostname or ""
+            if parsed.netloc.lower() != host:
+                return None
+            api_host = host in {"api.exotel.com", "api.in.exotel.com"} and url.startswith(self._base_url + "/")
+            s3_host = re.fullmatch(r"(?:[a-z0-9.-]+\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com", host)
+            if not api_host and not s3_host:
+                return None
+            request = self._http.build_request("GET", url, timeout=10)
+            response = await self._http.send(request, stream=True, auth=self._auth if api_host else None,
+                                             follow_redirects=False)
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if response.status_code == 200 and (content_type.startswith("audio/") or content_type == "application/octet-stream"):
+                return response
+            location = response.headers.get("location") if response.is_redirect else None
+            await response.aclose()
+            if not location:
+                return None
+            url = urljoin(url, location)
+        return None
+
+    async def recording_urls(self, call_sid: str) -> tuple[str | None, str | None]:
+        response = await self._http.get(
+            f"{self._base_url}/v1/Accounts/{self._account_sid}/Calls/{quote(call_sid, safe='')}.json",
+            auth=self._auth, timeout=10,
+        )
+        response.raise_for_status()
+        call = response.json()["Call"]
+        if call.get("Sid") != call_sid:
+            return None, None
+        return tuple(call.get(key) if isinstance(call.get(key), str) else None
+                     for key in ("RecordingUrl", "PreSignedRecordingUrl"))
+
+    async def connect_to_flow(
+        self,
+        number: str,
+        *,
+        status_callback: str,
+        time_limit: int,
+        ring_timeout: int,
+        caller_id: str | None = None,
+    ) -> str:
+        """Dial `number` and, once answered, run the App Bazaar flow. Returns the Exotel CallSid.
+
+        `caller_id` overrides this client's configured default (the tenant's own resolved outbound
+        number, M1); omitted/None keeps today's single engine-wide caller ID.
+        """
         if not self._app_id:
             raise ExotelError("EXOTEL_APP_ID is not configured")
         try:
@@ -90,7 +147,7 @@ class ExotelClient:
                 auth=self._auth,
                 data={
                     "From": number,
-                    "CallerId": self._caller_id,
+                    "CallerId": caller_id or self._caller_id,
                     "Url": f"http://my.exotel.com/{self._account_sid}/exoml/start_voice/{self._app_id}",
                     "TimeLimit": str(time_limit),
                     "TimeOut": str(ring_timeout),

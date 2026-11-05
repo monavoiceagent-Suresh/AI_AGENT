@@ -4,8 +4,10 @@ from contextlib import asynccontextmanager, suppress
 
 import httpx
 from fastapi import FastAPI
+from redis.asyncio import from_url as redis_from_url
 
 from app import api, db, dispatch
+from app.allocator import ChannelAllocator
 from app.calls import Services
 from app.config import get_settings
 from app.providers.bakbak_tts import BakbakTTS
@@ -126,11 +128,32 @@ def build_llm(http: httpx.AsyncClient, settings) -> FailoverLLM:
 async def lifespan(app: FastAPI):
     settings = get_settings()
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # HTTP client request logs include full URLs, including signed recording query strings.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     pool = await db.create_pool(settings.database_url, settings.database_pool_min_size, settings.database_pool_max_size)
     if applied := await db.migrate(pool):
         log.info("applied migrations: %s", ", ".join(applied))
     # One pooled client keeps TLS connections warm to Exotel, ElevenLabs, Deepgram, Groq and OpenRouter.
     http = httpx.AsyncClient(timeout=settings.tts_timeout_ms / 1000)
+    exotel = ExotelClient(
+        http,
+        base_url=settings.exotel_api_base_url,
+        account_sid=settings.exotel_account_sid,
+        api_key=settings.exotel_api_key.get_secret_value(),
+        api_token=settings.exotel_api_token.get_secret_value(),
+        caller_id=settings.exotel_caller_id,
+        app_id=settings.exotel_app_id,
+    )
+    # M2 channel allocator: required, no in-memory fallback (see Settings.redis_url / app/allocator.py).
+    redis = redis_from_url(
+        settings.redis_url,
+        socket_connect_timeout=settings.redis_connect_timeout_seconds,
+        socket_timeout=settings.redis_connect_timeout_seconds,
+    )
+    await redis.ping()
+    allocator = ChannelAllocator(redis, pool, settings)
+    await allocator.reconcile_on_startup(exotel)
     tts_by_provider = build_tts_providers(http, settings)
     asr_by_provider = build_asr_providers(settings)
     primary_tts = tts_by_provider[settings.tts_provider]
@@ -152,15 +175,7 @@ async def lifespan(app: FastAPI):
         settings=settings,
         pool=pool,
         http=http,
-        exotel=ExotelClient(
-            http,
-            base_url=settings.exotel_api_base_url,
-            account_sid=settings.exotel_account_sid,
-            api_key=settings.exotel_api_key.get_secret_value(),
-            api_token=settings.exotel_api_token.get_secret_value(),
-            caller_id=settings.exotel_caller_id,
-            app_id=settings.exotel_app_id,
-        ),
+        exotel=exotel,
         asr=primary_asr,
         fallback_asr=fallback_asr,
         asr_by_provider=asr_by_provider,
@@ -168,6 +183,7 @@ async def lifespan(app: FastAPI):
         tts=primary_tts,
         fallback_tts=fallback_tts,
         tts_by_provider=tts_by_provider,
+        allocator=allocator,
     )
     log.info("Exotel Voicebot applet URL: %s", voicebot_url(settings.public_base_url))
     if settings.inbound_reserved_calls >= settings.max_concurrent_calls:
@@ -183,6 +199,7 @@ async def lifespan(app: FastAPI):
             await dispatcher
         await http.aclose()
         await pool.close()
+        await redis.aclose()
 
 
 def voicebot_url(public_base_url: str) -> str:

@@ -18,28 +18,47 @@ from tests.test_outbound_dial import AGENT, FakePool, services
 pytestmark = pytest.mark.anyio
 
 PERSONA = {
-    "key": "sales", "name": "Sales", "language": "en", "workflow": "general",
-    "instructions": "Saved prompt", "greeting": "Hello", "knowledge": "", "version": 7,
+    "key": "sales",
+    "name": "Sales",
+    "language": "en",
+    "workflow": "general",
+    "instructions": "Saved prompt",
+    "greeting": "Hello",
+    "knowledge": "",
+    "version": 7,
 }
 
 
 def request(**overrides):
-    return DispatchIn(**({
-        "idempotencyKey": "request-key", "campaignId": "campaign", "clientId": "tenant",
-        "persona": PERSONA, "callingWindow": {"start": "09:00", "end": "18:00"},
-        "retryPolicy": {"maxTries": 3, "retryGapMinutes": 30, "callbackWindowDays": 3},
-        "leads": [{"id": "lead", "phone": "+919876543210", "name": "Asha"}],
-        "webhookUrl": "https://mona.example/api/webhooks/voice-engine",
-    } | overrides))
+    return DispatchIn(
+        **(
+            {
+                "idempotencyKey": "request-key",
+                "campaignId": "campaign",
+                "clientId": "tenant",
+                "persona": PERSONA,
+                "callingWindow": {"start": "09:00", "end": "18:00"},
+                "retryPolicy": {"maxTries": 3, "retryGapMinutes": 30, "callbackWindowDays": 3},
+                "leads": [{"id": "lead", "phone": "+919876543210", "name": "Asha"}],
+                "webhookUrl": "https://mona.example/api/webhooks/voice-engine",
+            }
+            | overrides
+        )
+    )
 
 
 async def test_reported_test_call_uses_the_existing_dispatcher_with_one_attempt(monkeypatch):
     accept = AsyncMock(return_value=DispatchOut(engine_job_id="engine-test", status="accepted"))
     monkeypatch.setattr(dispatch, "accept", accept)
     body = OutboundTestRequest(
-        client_id="tenant", persona=PERSONA, to="+919876543210", contact_name="Asha",
-        idempotency_key="request-key", webhook_url="https://mona.example/hook",
-        voice_id="voice", tts_model_id="m1",
+        client_id="tenant",
+        persona=PERSONA,
+        to="+919876543210",
+        contact_name="Asha",
+        idempotency_key="request-key",
+        webhook_url="https://mona.example/hook",
+        voice_id="voice",
+        tts_model_id="m1",
     )
     result = await api.place_test_call(body, SimpleNamespace())
     assert result.status == "accepted"
@@ -94,9 +113,20 @@ async def test_resumed_lead_keeps_attempts_and_the_later_retry_due_time():
     conn = Connection()
     future = datetime(2027, 1, 4, 5, tzinfo=UTC)
     retry = datetime(2027, 1, 4, 6, tzinfo=UTC)
-    await dispatch_db.create_job(Pool(conn), request(notBefore=future, leads=[{
-        "id": "lead", "phone": "+919876543210", "attempts": 2, "nextAttemptAt": retry,
-    }]))
+    await dispatch_db.create_job(
+        Pool(conn),
+        request(
+            notBefore=future,
+            leads=[
+                {
+                    "id": "lead",
+                    "phone": "+919876543210",
+                    "attempts": 2,
+                    "nextAttemptAt": retry,
+                }
+            ],
+        ),
+    )
     assert conn.leads[0][-2:] == (retry, 2)
 
 
@@ -115,8 +145,15 @@ async def test_concurrent_job_insert_conflict_returns_the_same_job(monkeypatch):
 
 async def test_dispatch_emits_started_with_existing_tenant_job_and_caller_id(monkeypatch):
     lead = {
-        "lead_pk": 1, "lead_id": "lead", "phone": "+919876543210", "name": "Asha",
-        "attempts": 0, "agent_id": 3, "job_id": "engine-job", "voice_id": "voice", "tts_model_id": "m1",
+        "lead_pk": 1,
+        "lead_id": "lead",
+        "phone": "+919876543210",
+        "name": "Asha",
+        "attempts": 0,
+        "agent_id": 3,
+        "job_id": "engine-job",
+        "voice_id": "voice",
+        "tts_model_id": "m1",
     }
     svc = services(FakePool())
     monkeypatch.setattr(dispatch_db, "next_due_lead", AsyncMock(return_value=lead))
@@ -129,7 +166,7 @@ async def test_dispatch_emits_started_with_existing_tenant_job_and_caller_id(mon
     enqueue = AsyncMock()
     monkeypatch.setattr(dispatch_db, "enqueue_event", enqueue)
     assert await dispatch.place_next_call(svc)
-    assert placed.call_args.kwargs == {"voice_id": "voice", "tts_model_id": "m1"}
+    assert placed.call_args.kwargs == {"voice_id": "voice", "tts_model_id": "m1", "caller_id": None}
     event = enqueue.call_args.args[2]
     assert event["engineJobId"] == "engine-job" and event["eventType"] == "call.started"
     assert event["data"]["engineCallId"] == "42"
@@ -138,7 +175,7 @@ async def test_dispatch_emits_started_with_existing_tenant_job_and_caller_id(mon
 
 async def test_concurrent_outbound_requests_cannot_take_the_same_capacity_slot():
     svc = services(FakePool())
-    svc.settings.max_concurrent_calls = 1
+    svc.allocator.max_concurrent_calls = 1
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def dial(*args, **kwargs):
@@ -155,7 +192,7 @@ async def test_concurrent_outbound_requests_cannot_take_the_same_capacity_slot()
     finally:
         release.set()
         await first
-    assert list(svc.ringing) == ["CAone"]
+    assert list(svc.allocator.call_sids) == ["CAone"]
 
 
 async def test_failed_placement_releases_capacity():
@@ -163,35 +200,49 @@ async def test_failed_placement_releases_capacity():
     svc.exotel.connect_to_flow = AsyncMock(side_effect=ExotelError("provider refused"))
     with pytest.raises(ExotelError):
         await calls.place_outbound_call(svc, AGENT, "+919876543210", None)
-    assert not svc.ringing
+    assert not svc.allocator.allocations
 
 
 async def test_nonterminal_callbacks_do_not_end_a_ringing_call(monkeypatch):
     svc = services(FakePool())
-    svc.ringing["CAone"] = 0
+    allocation_id = "out-1"
+    svc.allocator.allocations[allocation_id] = "outbound"
+    svc.allocator.call_sids["CAone"] = allocation_id
     update = AsyncMock(return_value=True)
     monkeypatch.setattr(db, "apply_status_callback", update)
     await calls.call_status(svc, "CAone", "ringing")
-    assert "CAone" in svc.ringing
+    assert "CAone" in svc.allocator.call_sids
     update.assert_not_called()
     await calls.call_status(svc, "CAone", "no-answer")
     update.assert_awaited_once_with(svc.pool, "CAone", "no_answer")
-    assert "CAone" not in svc.ringing
+    assert "CAone" not in svc.allocator.call_sids
+    assert allocation_id not in svc.allocator.allocations
 
 
 @pytest.mark.parametrize("unknown, state", [(False, "retry"), (True, "exhausted")])
 async def test_only_confirmed_dial_failures_are_automatically_retried(monkeypatch, unknown, state):
     svc = services(FakePool())
     lead = {
-        "lead_pk": 1, "lead_id": "lead", "phone": "+919876543210", "name": "Asha",
-        "attempts": 0, "agent_id": 3, "job_id": "job", "job_status": "running",
-        "max_tries": 3, "retry_gap_minutes": 30, "voice_id": None, "tts_model_id": None,
+        "lead_pk": 1,
+        "lead_id": "lead",
+        "phone": "+919876543210",
+        "name": "Asha",
+        "attempts": 0,
+        "agent_id": 3,
+        "job_id": "job",
+        "job_status": "running",
+        "max_tries": 3,
+        "retry_gap_minutes": 30,
+        "voice_id": None,
+        "tts_model_id": None,
     }
     monkeypatch.setattr(dispatch_db, "next_due_lead", AsyncMock(return_value=lead))
     monkeypatch.setattr(dispatch_db, "claim_lead", AsyncMock(return_value=True))
     monkeypatch.setattr(db, "get_agent", AsyncMock(return_value={}))
     monkeypatch.setattr(dispatch, "Agent", lambda **_: AGENT)
-    monkeypatch.setattr(calls, "place_outbound_call", AsyncMock(side_effect=ExotelError("failed", placement_unknown=unknown)))
+    monkeypatch.setattr(
+        calls, "place_outbound_call", AsyncMock(side_effect=ExotelError("failed", placement_unknown=unknown))
+    )
     settle = AsyncMock()
     monkeypatch.setattr(dispatch_db, "settle_lead", settle)
     assert await dispatch.place_next_call(svc)
@@ -213,5 +264,16 @@ async def test_stale_claim_recovery_reports_unknown_placement_instead_of_rediall
 
 
 async def test_health_advertises_the_reported_outbound_contract():
-    svc = SimpleNamespace(pool=SimpleNamespace(fetchval=AsyncMock(return_value=1)), active_calls=0)
+    svc = SimpleNamespace(
+        pool=SimpleNamespace(fetchval=AsyncMock(return_value=1)),
+        allocator=SimpleNamespace(occupied=AsyncMock(return_value=0)),
+    )
     assert (await api.health(svc))["outbound_dispatch_version"] == 1
+
+
+async def test_ambiguous_placement_retains_capacity():
+    svc = services(FakePool())
+    svc.exotel.connect_to_flow = AsyncMock(side_effect=ExotelError("timeout", placement_unknown=True))
+    with pytest.raises(ExotelError):
+        await calls.place_outbound_call(svc, AGENT, "+919876543210", None)
+    assert len(svc.allocator.allocations) == 1

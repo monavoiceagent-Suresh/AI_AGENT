@@ -111,6 +111,17 @@ class Settings(BaseSettings):
     database_pool_min_size: int = 1
     database_pool_max_size: int = 5
 
+    # Required: the M2 channel allocator (app/allocator.py) has no in-memory fallback. A missing
+    # value fails the engine at startup with a clear error, rather than silently reverting to the
+    # old per-process capacity accounting this replaces.
+    redis_url: str
+    redis_connect_timeout_seconds: float = Field(5.0, gt=0)
+    # Namespaces the allocator's Redis hash key, so more than one engine deployment (or a test
+    # suite) can share one Redis without their reservations colliding.
+    redis_key_prefix: str = "allocator"
+    # Compatibility setting only: reservations no longer expire without terminal proof.
+    allocation_reservation_seconds: int = Field(90, gt=0)
+
     session_idle_timeout_seconds: int = 120
     # Silence after speech before Scribe commits a transcript (end of user turn).
     endpointing_min_silence_ms: int = 300
@@ -177,6 +188,11 @@ class Settings(BaseSettings):
     # credentials) and try the ExoPhone that was dialled. Exotel's stream `to` is not always that number.
     exotel_resolve_called_number: bool = True
     exotel_lookup_timeout_seconds: float = Field(3.0, gt=0, le=10)
+
+    # Stage of the engine's own tenant validation (app/tenants.py): "log_only" never blocks a
+    # request over an unrecognised/suspended client_id, only logs it; "enforcing" rejects it.
+    # Flip only after Mona has backfilled and is keeping every existing tenant synced (PUT /tenants).
+    tenant_validation_mode: Literal["log_only", "enforcing"] = "log_only"
 
     @model_validator(mode="after")
     def _check_webhook_url(self) -> Self:

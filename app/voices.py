@@ -5,10 +5,15 @@ means is specific to the account that owns the API key, so the engine proxies th
 instead of guessing at one.
 """
 
+import asyncio
+import io
+import wave
+from contextlib import aclosing
 from typing import Any
 
 import httpx
 
+from app.calls import Services, _default_tts_voice
 from app.config import Settings
 from app.models import VoiceOption, VoicesOut
 
@@ -29,6 +34,49 @@ DEEPGRAM_AURA_EN_VOICES = (
 
 class VoicesUnavailable(Exception):
     """The provider's voices endpoint could not be reached or answered with an error."""
+
+
+_PREVIEW_TEXT = {
+    "en": "Hello! This is a preview of how my voice sounds on Mona.",
+    "hi": "नमस्ते! यह मोना पर मेरी आवाज़ का एक नमूना है।",
+    "ta": "வணக்கம்! இது மோனாவில் என் குரலின் ஒரு மாதிரி.",
+    "te": "నమస్కారం! ఇది మోనాలో నా స్వరానికి ఒక నమూనా.",
+}
+
+
+async def preview_voice(svc: Services, voice_id: str) -> bytes | None:
+    """Render a fixed sample with a voice from the same catalogue used by the picker."""
+    catalogue = await list_voices(svc.http, svc.settings)
+    voice = next((option for option in catalogue.voices if option.voice_id == voice_id), None)
+    if voice is None:
+        return None
+    label = (voice.language or "en").lower().replace("_", "-").split("-", 1)[0]
+    language = {"english": "en", "hindi": "hi", "tamil": "ta", "telugu": "te"}.get(label, label)
+    if language not in _PREVIEW_TEXT:
+        language = "en"
+    default = _default_tts_voice(svc.settings.tts_provider, svc.settings, language)
+    if default is None and svc.settings.tts_provider != "bakbak":
+        language = "en"
+        default = _default_tts_voice(svc.settings.tts_provider, svc.settings, language)
+    model = voice.model_id or (default.model_id if default else None)
+    if not model:
+        raise VoicesUnavailable("Preview model unavailable")
+    sample_rate = 16000
+    pcm = bytearray()
+    stream = svc.tts.stream(_PREVIEW_TEXT[language], voice_id=voice.voice_id, model_id=model,
+                            language=language, sample_rate=sample_rate, previous_text="")
+    async with asyncio.timeout(15), aclosing(stream):
+        async for chunk in stream:
+            pcm.extend(chunk[: sample_rate * 20 - len(pcm)])
+            if len(pcm) >= sample_rate * 20:
+                break
+    if len(pcm) < 2:
+        raise VoicesUnavailable("Provider returned no audio")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setparams((1, 2, sample_rate, 0, "NONE", "not compressed"))
+        wav.writeframes(pcm[:len(pcm) - len(pcm) % 2])
+    return output.getvalue()
 
 
 def _as_list(payload: Any) -> list[dict[str, Any]]:

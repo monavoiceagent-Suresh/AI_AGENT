@@ -70,6 +70,9 @@ class FakeExotel:
 
 async def _admin_dsn_and_db() -> tuple[str, str]:
     base = Settings().database_url
+    from urllib.parse import urlsplit
+    if urlsplit(base).hostname not in {"127.0.0.1", "localhost", "::1"}:
+        pytest.skip("Integration fixtures require a loopback PostgreSQL host")
     name = f"voice_agent_test_{uuid.uuid4().hex[:8]}"
     conn = await asyncpg.connect(base, timeout=5)
     try:
@@ -87,15 +90,34 @@ async def _drop(base: str, name: str) -> None:
         await conn.close()
 
 
+async def _check_redis(url: str) -> None:
+    from redis.asyncio import from_url
+
+    redis = from_url(url, socket_connect_timeout=2)
+    try:
+        await redis.ping()
+    finally:
+        await redis.aclose()
+
+
 @pytest.fixture
 def client(monkeypatch):
     try:
         base, name = asyncio.run(_admin_dsn_and_db())
     except (OSError, asyncpg.PostgresError) as exc:
         pytest.skip(f"PostgreSQL not reachable (docker compose up -d db): {exc}")
+    redis_url = "redis://127.0.0.1:6379/0"
+    try:
+        asyncio.run(_check_redis(redis_url))
+    except Exception as exc:
+        pytest.skip(f"Redis not reachable (docker compose up -d redis): {exc}")
     test_dsn = base.rsplit("/", 1)[0] + f"/{name}"
     for key, value in {
         "DATABASE_URL": test_dsn,
+        # A fresh prefix per test: this Redis instance is shared (unlike the throwaway Postgres
+        # database above), so tests must not see each other's reservations.
+        "REDIS_URL": redis_url,
+        "REDIS_KEY_PREFIX": f"test-{uuid.uuid4().hex[:8]}",
         "APP_SECRET_KEY": "test-admin",
         "EXOTEL_API_KEY": "test-key",
         "EXOTEL_API_TOKEN": "test-token",

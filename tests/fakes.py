@@ -109,6 +109,59 @@ class FakeTTS:
             yield bytes(sample_rate * 2 // 10)
 
 
+class FakeAllocator:
+    """A minimal in-memory stand-in for app.allocator.ChannelAllocator, for tests that exercise
+    call-placement logic with no real Redis/Postgres. Mirrors just the behaviour callers depend
+    on: an admission limit with the inbound-reserved carve-out, and idempotent reserve/release.
+    """
+
+    def __init__(self, *, max_concurrent_calls: int = 10, inbound_reserved_calls: int = 0) -> None:
+        self.max_concurrent_calls = max_concurrent_calls
+        self.inbound_reserved_calls = inbound_reserved_calls
+        self.allocations: dict[str, str] = {}  # allocation id -> direction
+        self.call_sids: dict[str, str] = {}  # call_sid -> allocation id
+
+    async def reserve(
+        self,
+        allocation_id: str,
+        direction: str,
+        *,
+        call_sid: str | None = None,
+        client_id: str | None = None,
+        route_phone: str | None = None,
+        dispatch_lead_id: int | None = None,
+    ) -> bool:
+        if allocation_id in self.allocations:
+            return True
+        limit = self.max_concurrent_calls - (self.inbound_reserved_calls if direction == "outbound" else 0)
+        if len(self.allocations) >= limit:
+            return False
+        self.allocations[allocation_id] = direction
+        if call_sid:
+            self.call_sids[call_sid] = allocation_id
+        return True
+
+    async def set_call_sid(self, allocation_id: str, call_sid: str) -> None:
+        self.call_sids[call_sid] = allocation_id
+
+    async def mark_connected(self, allocation_id: str) -> None:
+        pass
+
+    async def mark_connected_by_call_sid(self, call_sid: str) -> None:
+        pass
+
+    async def release(self, allocation_id: str) -> None:
+        self.allocations.pop(allocation_id, None)
+
+    async def release_by_call_sid(self, call_sid: str) -> None:
+        allocation_id = self.call_sids.pop(call_sid, None)
+        if allocation_id:
+            self.allocations.pop(allocation_id, None)
+
+    async def occupied(self) -> int:
+        return len(self.allocations)
+
+
 def make_settings(**overrides) -> Settings:
     base = dict(
         app_secret_key="s",
@@ -124,6 +177,7 @@ def make_settings(**overrides) -> Settings:
         llm_provider="openrouter",
         openrouter_fallback_model="fallback-model",
         database_url="postgresql://x",
+        redis_url="redis://x",
         bakbak_api_key="b",
         deepgram_api_key="dg",
         bakbak_voices={

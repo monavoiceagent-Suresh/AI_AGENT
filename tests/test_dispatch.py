@@ -81,7 +81,9 @@ def ready(client, sink):  # noqa: F811
 
 
 def start(client, **overrides) -> str:  # noqa: F811
-    response = client.post("/campaigns/dispatch", json=dispatch_body(**overrides), headers=ADMIN)
+    body = dispatch_body(**overrides)
+    client.put("/tenants", json={"id": body["clientId"], "name": "Test", "status": "active"}, headers=ADMIN)
+    response = client.post("/campaigns/dispatch", json=body, headers=ADMIN)
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "accepted", response.text
     return response.json()["engineJobId"]
@@ -300,6 +302,31 @@ def test_dispatch_is_idempotent_and_allows_one_open_job_per_campaign(ready):
     second = ready.post("/campaigns/dispatch", json=dispatch_body(), headers=ADMIN).json()
     assert second["status"] == "rejected" and "unfinished dispatch" in second["reason"]
     assert len(ready.app.state.services.exotel.dialled) <= 1  # the replay never dials twice
+
+
+def test_a_resolved_caller_id_is_snapshotted_on_the_job_and_used_for_every_event(ready, sink):
+    start(ready, callerId="+918000000099")
+    wait_until(lambda: ready.app.state.services.exotel.dialled)
+    call_id = first_call_id(ready)
+    converse(ready, "CAout1")
+
+    wait_until(lambda: "job.completed" in sink.types())
+    started_event, call_event, _job_event = (event(d) for d in sink.deliveries)
+    assert started_event["data"]["callerNumber"] == "+918000000099"
+    assert call_event["data"]["callerNumber"] == "+918000000099"
+    assert ready.app.state.services.exotel.dialled  # sanity: a call was actually placed
+    assert ready.get(f"/calls/{call_id}", headers=ADMIN).json()["from_number"] == "+918000000099"
+
+
+def test_no_caller_id_keeps_using_the_engine_wide_default(ready, sink):
+    start(ready)  # no callerId: the existing contract, unchanged
+    wait_until(lambda: ready.app.state.services.exotel.dialled)
+    first_call_id(ready)
+    converse(ready, "CAout1")
+
+    wait_until(lambda: "job.completed" in sink.types())
+    call_event = event(sink.deliveries[1])
+    assert call_event["data"]["callerNumber"] == ready.app.state.services.settings.exotel_caller_id
 
 
 def test_unknown_job_is_not_found(ready):

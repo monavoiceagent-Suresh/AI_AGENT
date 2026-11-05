@@ -269,6 +269,12 @@ class DispatchIn(VoiceChoice):
     webhook_url: str = Field(max_length=500)
     # A UTC instant. Existing next_attempt_at and the India calling window enforce both constraints.
     not_before: datetime | None = None
+    # The outbound caller ID Mona resolved and validated for this tenant/campaign at dispatch time
+    # (M1 number inventory). Persisted on the job as a snapshot (app/dispatch_db.py create_job): once
+    # accepted, a job keeps this value even if Mona's own assignment later changes. None means the
+    # caller did not resolve one (a job created before this field existed, or a legacy caller), so
+    # calls keep using the engine-wide EXOTEL_CALLER_ID, exactly as before this field existed.
+    caller_id: str | None = Field(None, pattern=r"^\+[1-9][0-9]{9,14}$")
 
     @field_validator("not_before")
     @classmethod
@@ -293,6 +299,48 @@ class DispatchIn(VoiceChoice):
         if any(lead.attempts >= self.retry_policy.max_tries for lead in self.leads):
             raise ValueError("leads must have attempts remaining")
         return self
+
+
+class TenantCapacityOut(_Camel):
+    """One tenant's share of the account-wide channel budget, for the Super Admin capacity view."""
+
+    client_id: str
+    connected: int
+    reserved: int
+    queued_leads: int
+
+
+class CapacityOut(_Camel):
+    """`GET /capacity`: the M2 allocator's live state, for Super Admin operational visibility (M3)."""
+
+    max_concurrent_calls: int
+    inbound_reserved_calls: int
+    occupied: int
+    connected: int
+    reserved: int
+    inbound_occupied: int
+    outbound_occupied: int
+    unattributed: int = 0
+    # Rows whose state suggests a stuck/lost transition — never expected in healthy operation; a
+    # non-zero count here is worth an operator's attention (see app/monitoring.py).
+    stale_reserved: int
+    stuck_releasing: int
+    tenants: list[TenantCapacityOut]
+
+
+class TenantSyncIn(_Camel):
+    """`PUT /tenants`: Mona's own record of one tenant, mirrored here for the engine's own
+    client_id validation (app/tenants.py). Not a second source of truth for tenant data."""
+
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=200)
+    status: Literal["active", "suspended"]
+
+
+class TenantOut(_Camel):
+    id: str
+    name: str
+    status: Literal["active", "suspended"]
 
 
 class InboundRoutePublishIn(_Camel):

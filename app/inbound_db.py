@@ -78,19 +78,24 @@ async def publish_route(
             "SELECT client_id, version, active, persona FROM inbound_routes WHERE phone = $1", phone
         )
         if current is not None:
-            if current["client_id"] != request.client_id:
+            if current["client_id"] != request.client_id and current["active"]:
                 raise NumberTaken
             if request.version < current["version"]:
                 raise StaleVersion(current["version"])
             if request.version == current["version"]:
-                if current["active"] == request.active and current["persona"] == persona:
+                if (
+                    current["client_id"] == request.client_id
+                    and current["active"] == request.active
+                    and current["persona"] == persona
+                ):
                     return "unchanged"
                 raise VersionConflict
         agent_id = await dispatch_db.upsert_persona_agent(conn, request.client_id, request.persona)
         await conn.execute(
             "INSERT INTO inbound_routes (phone, client_id, agent_id, version, active, persona) "
             "VALUES ($1, $2, $3, $4, $5, $6) "
-            "ON CONFLICT (phone) DO UPDATE SET agent_id = EXCLUDED.agent_id, version = EXCLUDED.version, "
+            "ON CONFLICT (phone) DO UPDATE SET client_id = EXCLUDED.client_id, "
+            "agent_id = EXCLUDED.agent_id, version = EXCLUDED.version, "
             "active = EXCLUDED.active, persona = EXCLUDED.persona, published_at = now()",
             phone,
             request.client_id,
