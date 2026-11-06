@@ -202,7 +202,11 @@ async def place_next_call(svc: Services) -> bool:
             tts_model_id=lead["tts_model_id"],
             caller_id=lead.get("caller_id"),
         )
-    except CallRejected:
+    except CallRejected as exc:
+        # Released, not failed: a transient rejection (e.g. capacity) should let the next poll
+        # retry it. Logged so a tenant that will reject on every retry (e.g. unrecognized at the
+        # enforced outbound-admission gate in calls.place_outbound_call) doesn't stall silently.
+        log.warning("lead %s not placed, releasing for retry: %s", lead["lead_id"], exc)
         await dispatch_db.release_lead(svc.pool, lead["lead_pk"])
         return False
     except ExotelError as exc:
