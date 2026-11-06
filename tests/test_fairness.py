@@ -66,7 +66,7 @@ def test_a_tenant_with_no_calls_in_flight_is_preferred_over_a_busier_tenant(clie
     busy_leads = insert_job_with_leads(client, "tenant-a", "campaign-a", ["+919876500001", "+919876500002"], calling=1)
     idle_leads = insert_job_with_leads(client, "tenant-b", "campaign-b", ["+919876500003"])
 
-    picked = client.portal.call(dispatch_db.next_due_lead, client.app.state.services.pool)
+    picked = client.portal.call(dispatch_db.next_due_lead, client.app.state.services.pool, True)
 
     assert picked["lead_pk"] == idle_leads[0]  # tenant B (0 in flight) beats tenant A's due second lead
     assert picked["lead_pk"] != busy_leads[1]
@@ -77,7 +77,7 @@ def test_ties_within_a_tenant_still_break_by_how_overdue_the_lead_is(client):  #
     oldest-due-first rule (preserved from before M3) still applies."""
     lead_ids = insert_job_with_leads(client, "tenant-a", "campaign-a", ["+919876500006", "+919876500007"])
 
-    picked = client.portal.call(dispatch_db.next_due_lead, client.app.state.services.pool)
+    picked = client.portal.call(dispatch_db.next_due_lead, client.app.state.services.pool, True)
 
     assert picked["lead_pk"] == lead_ids[0]  # inserted (and thus due) first
 
@@ -104,7 +104,7 @@ def test_single_slot_rotates_across_sustained_backlogs(client):  # noqa: F811
     pool = client.app.state.services.pool
     picked = []
     for _ in range(8):
-        lead = client.portal.call(dispatch_db.next_due_lead, pool)
+        lead = client.portal.call(dispatch_db.next_due_lead, pool, True)
         picked.append(lead["lead_pk"])
         assert client.portal.call(dispatch_db.claim_lead, pool, lead["lead_pk"])
         client.portal.call(dispatch_db.release_lead, pool, lead["lead_pk"])
@@ -116,7 +116,9 @@ def test_suspended_tenant_is_excluded_from_queued_dispatch(client):  # noqa: F81
     insert_job_with_leads(client, "tenant-a", "suspended-a", ["+919876501010"])
     pool = client.app.state.services.pool
     client.portal.call(pool.execute, "UPDATE tenants SET status = 'suspended' WHERE id = 'tenant-a'")
-    assert client.portal.call(dispatch_db.next_due_lead, pool) is None
+    assert client.portal.call(dispatch_db.next_due_lead, pool, True) is None
+    picked = client.portal.call(dispatch_db.next_due_lead, pool, False)
+    assert picked is not None  # log_only mode never blocks placement on tenant status
 
 
 def test_suspended_tenant_is_rejected_at_inbound_admission(client):  # noqa: F811

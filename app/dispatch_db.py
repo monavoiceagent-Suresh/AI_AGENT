@@ -155,11 +155,15 @@ async def cancel_job(pool: asyncpg.Pool, job_id: str) -> str | None:
 # ---- placing calls ---------------------------------------------------------------------------
 
 
-async def next_due_lead(pool: asyncpg.Pool) -> asyncpg.Record | None:
+async def next_due_lead(pool: asyncpg.Pool, enforcing: bool) -> asyncpg.Record | None:
     """Choose the least-loaded tenant, then the least recently served tenant.
 
     Persistent service history prevents oldest-backlog starvation when loads return to zero.
     The dispatcher remains single-owner; claim_lead uses compare-and-set for duplicate claims.
+
+    In log_only mode (enforcing=False) a tenant missing from (or suspended in) the `tenants`
+    table must still get its calls placed — tenants.require_known only logs there, so this
+    query cannot be the one place that actually blocks it.
     """
     return await pool.fetchrow(
         "WITH tenant_load AS ("
@@ -170,13 +174,15 @@ async def next_due_lead(pool: asyncpg.Pool) -> asyncpg.Record | None:
         "j.agent_id, j.max_tries, j.retry_gap_minutes, j.voice_id, j.tts_model_id, j.caller_id "
         "FROM dispatch_leads l JOIN dispatch_jobs j ON j.id = l.job_id "
         "LEFT JOIN tenant_load t ON t.client_id = j.client_id "
-        "JOIN tenants tenant ON tenant.id = j.client_id AND tenant.status = 'active' "
+        "LEFT JOIN tenants tenant ON tenant.id = j.client_id "
         "WHERE l.status = 'pending' AND l.next_attempt_at <= now() AND j.status IN ('queued', 'running') "
         "AND l.attempts < j.max_tries "
+        "AND (NOT $1 OR tenant.status = 'active') "
         "AND to_char(now() AT TIME ZONE 'Asia/Kolkata', 'HH24:MI') BETWEEN j.window_start AND j.window_end "
         "ORDER BY COALESCE(t.in_flight, 0) ASC, "
         "(SELECT max(j3.last_served_at) FROM dispatch_jobs j3 WHERE j3.client_id = j.client_id) ASC NULLS FIRST, "
-        "l.next_attempt_at ASC, l.id ASC LIMIT 1"
+        "l.next_attempt_at ASC, l.id ASC LIMIT 1",
+        enforcing,
     )
 
 

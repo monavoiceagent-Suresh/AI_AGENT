@@ -185,7 +185,8 @@ async def place_next_call(svc: Services) -> bool:
     """
     if not svc.settings.enable_outbound_calls:
         return False
-    lead = await dispatch_db.next_due_lead(svc.pool)
+    enforcing = svc.settings.tenant_validation_mode == "enforcing"
+    lead = await dispatch_db.next_due_lead(svc.pool, enforcing=enforcing)
     if lead is None or not await dispatch_db.claim_lead(svc.pool, lead["lead_pk"]):
         return False
     attempt = {**lead, "attempts": lead["attempts"] + 1}
