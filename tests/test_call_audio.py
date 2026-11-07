@@ -36,6 +36,25 @@ async def test_recording_redirect_does_not_forward_exotel_credentials():
 
 
 @pytest.mark.anyio
+async def test_recording_url_given_as_plain_http_is_fetched_over_https():
+    seen = []
+
+    def serve(request):
+        seen.append(request)
+        assert request.url.scheme == "https"
+        return httpx.Response(200, headers={"Content-Type": "audio/mpeg"}, content=b"sample")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(serve)) as http:
+        exotel = ExotelClient(http, base_url="https://api.exotel.com", account_sid="test", api_key="test",
+                              api_token="test", caller_id="unused", app_id="unused")
+        audio = await exotel.open_recording("http://api.exotel.com/recordings/sample")
+        assert audio is not None
+        assert await audio.aread() == b"sample"
+        await audio.aclose()
+    assert len(seen) == 1
+
+
+@pytest.mark.anyio
 async def test_recording_checks_tenant_before_fetching_and_refreshes_expired_url():
     old_url = "https://s3.amazonaws.com/exotelrecordings/old.mp3"
     signed_url = "https://s3.amazonaws.com/exotelrecordings/new.mp3"

@@ -88,8 +88,15 @@ class ExotelClient:
         )
 
     async def open_recording(self, url: str) -> httpx.Response | None:
-        """Open audio from Exotel or S3. Recheck redirects before forwarding any credentials."""
+        """Open audio from Exotel or S3. Recheck redirects before forwarding any credentials.
+
+        Exotel's own RecordingUrl/PreSignedRecordingUrl is commonly handed back as plain http even
+        though the same host also serves https; it is upgraded here before any check or fetch so
+        credentials are never sent unencrypted.
+        """
         for _ in range(4):
+            if url.startswith("http://"):
+                url = "https://" + url[len("http://"):]
             parsed = urlsplit(url)
             if parsed.scheme != "https" or parsed.username is not None or parsed.password is not None:
                 return None
