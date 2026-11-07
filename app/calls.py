@@ -94,7 +94,11 @@ def voice_for(agent: AgentIn, settings: Settings) -> Voice:
     provider = agent.tts_provider or settings.tts_provider
     default = _default_tts_voice(provider, settings, agent.language)
     assert default is not None, "validate_agent must reject an agent whose language the primary cannot speak"
-    return Voice(voice_id=agent.voice_id or default.voice_id, model_id=agent.tts_model_id or default.model_id)
+    return Voice(
+        voice_id=agent.voice_id or default.voice_id,
+        model_id=agent.tts_model_id or default.model_id,
+        settings=agent.voice_settings,
+    )
 
 
 def fallback_voice_for(agent: AgentIn, settings: Settings) -> Voice | None:

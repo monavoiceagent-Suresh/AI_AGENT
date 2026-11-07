@@ -37,6 +37,7 @@ class DeepgramTTS:
         language: str,
         sample_rate: int,
         previous_text: str,  # Aura has no continuity context; kept for the shared TTS interface
+        voice_settings: dict | None = None,  # Aura has no tone controls; kept for the shared TTS interface
     ) -> AsyncIterator[bytes]:
         if language != "en":
             raise TTSError(f"Deepgram Aura cannot speak language {language!r}; it only has English voices")

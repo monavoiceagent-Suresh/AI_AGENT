@@ -41,6 +41,7 @@ class BakbakTTS:
         language: str,
         sample_rate: int,
         previous_text: str,  # Bakbak has no continuity context; kept for the shared TTS interface
+        voice_settings: dict | None = None,  # Bakbak has no tone controls; kept for the shared TTS interface
     ) -> AsyncIterator[bytes]:
         body = {
             "text": text,

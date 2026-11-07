@@ -68,6 +68,26 @@ async def test_elevenlabs_voices_use_the_xi_api_key_header_and_the_label_languag
     assert result.voices[0].model_id is None  # ElevenLabs voices are not tied to one model
 
 
+async def test_elevenlabs_voices_normalize_language_names_and_default_untagged_ones_to_english():
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "voices": [
+                    {"voice_id": "e1", "name": "Anitha", "labels": {"language": "tamil"}},
+                    {"voice_id": "e2", "name": "Priya", "labels": {"language": "hindi"}},
+                    {"voice_id": "e3", "name": "Lakshmi", "labels": {"language": "telugu"}},
+                    {"voice_id": "e4", "name": "Rachel", "labels": {"age": "young"}},  # no language label at all
+                ]
+            },
+        )
+
+    settings = make_settings(tts_provider="elevenlabs_standard")
+    result = await list_voices(client(handler), settings)
+
+    assert [v.language for v in result.voices] == ["ta", "hi", "te", "en"]
+
+
 async def test_elevenlabs_premium_tier_uses_the_same_vendor_voice_list():
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"voices": [{"voice_id": "e1", "name": "Rachel"}]})

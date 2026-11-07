@@ -36,6 +36,17 @@ class VoicesUnavailable(Exception):
     """The provider's voices endpoint could not be reached or answered with an error."""
 
 
+_LANGUAGE_NAMES = {"english": "en", "hindi": "hi", "tamil": "ta", "telugu": "te"}
+
+
+def _normalize_language(label: str | None) -> str:
+    """ElevenLabs' own language codes/names, folded into the engine's "en"/"hi"/"ta"/"te". Untagged voices
+    (most of ElevenLabs' default catalogue) default to "en" — they are English, just not labelled as such.
+    A genuinely unrecognized value is kept as-is rather than discarded."""
+    key = (label or "en").lower().replace("_", "-").split("-", 1)[0]
+    return _LANGUAGE_NAMES.get(key, key)
+
+
 _PREVIEW_TEXT = {
     "en": "Hello! This is a preview of how my voice sounds on Mona.",
     "hi": "नमस्ते! यह मोना पर मेरी आवाज़ का एक नमूना है।",
@@ -50,8 +61,7 @@ async def preview_voice(svc: Services, voice_id: str) -> bytes | None:
     voice = next((option for option in catalogue.voices if option.voice_id == voice_id), None)
     if voice is None:
         return None
-    label = (voice.language or "en").lower().replace("_", "-").split("-", 1)[0]
-    language = {"english": "en", "hindi": "hi", "tamil": "ta", "telugu": "te"}.get(label, label)
+    language = _normalize_language(voice.language)
     if language not in _PREVIEW_TEXT:
         language = "en"
     default = _default_tts_voice(svc.settings.tts_provider, svc.settings, language)
@@ -123,7 +133,9 @@ def _parse_elevenlabs(payload: Any) -> list[VoiceOption]:
         if not voice_id or not name:
             continue
         labels = item.get("labels") if isinstance(item.get("labels"), dict) else {}
-        options.append(VoiceOption(voice_id=voice_id, name=name, language=labels.get("language"), model_id=None))
+        options.append(
+            VoiceOption(voice_id=voice_id, name=name, language=_normalize_language(labels.get("language")), model_id=None)
+        )
     return options
 
 

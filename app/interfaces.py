@@ -99,6 +99,9 @@ class Voice(BaseModel):
 
     voice_id: str
     model_id: str
+    # ElevenLabs stability/similarity_boost/style, when a campaign or test call chose its own tone;
+    # None means the provider's own fixed default. Only ElevenLabs reads this.
+    settings: dict | None = None
 
 
 class TTS(Protocol):
@@ -111,5 +114,6 @@ class TTS(Protocol):
         language: str,
         sample_rate: int,
         previous_text: str,
+        voice_settings: dict | None = None,
     ) -> AsyncIterator[bytes]:
-        """Yield 16-bit PCM audio at sample_rate."""
+        """Yield 16-bit PCM audio at sample_rate. voice_settings only has any effect on ElevenLabs."""

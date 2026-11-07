@@ -25,11 +25,14 @@ class ElevenLabsTTS:
         language: str,
         sample_rate: int,
         previous_text: str,
+        voice_settings: dict | None = None,
     ) -> AsyncIterator[bytes]:
         body = {
             "text": text,
             "model_id": model_id,
-            "voice_settings": self._voice_settings,
+            # The call's own override (e.g. a campaign's chosen tone) wins per-field; anything it
+            # doesn't set keeps this provider instance's fixed default.
+            "voice_settings": {**self._voice_settings, **{k: v for k, v in (voice_settings or {}).items() if v is not None}},
         }
         # eleven_v3 rejects text continuity fields, including previous_text set to null.
         if model_id != "eleven_v3":

@@ -59,6 +59,9 @@ class AgentIn(BaseModel):
     tts_model_id: str | None = Field(
         None, description="Overrides the default TTS model (Bakbak: standard or m1, the voice_id's model)."
     )
+    voice_settings: dict | None = Field(
+        None, description="ElevenLabs stability/similarity_boost/style overrides for voice_id. Only ElevenLabs reads this."
+    )
     llm_model: str | None = Field(
         None,
         description=(
@@ -224,12 +227,22 @@ class PersonaIn(_Camel):
         return self
 
 
+class VoiceSettingsIn(_Camel):
+    """ElevenLabs' own expressiveness controls for a chosen voice. Any field left unset keeps the
+    engine's fixed default for that field — this never applies to non-ElevenLabs providers."""
+
+    stability: float | None = Field(None, ge=0, le=1)
+    similarity_boost: float | None = Field(None, ge=0, le=1)
+    style: float | None = Field(None, ge=0, le=1)
+
+
 class VoiceChoice(_Camel):
     """A campaign's (or test call's) own voice choice, from the real voices GET /voices lists. Overrides
     whatever the agent for this persona already has; set both or neither, like AgentIn's voice_id/tts_model_id."""
 
     voice_id: str | None = Field(None, min_length=1)
     tts_model_id: str | None = Field(None, min_length=1)
+    voice_settings: VoiceSettingsIn | None = None
 
 
 class TestCallIn(VoiceChoice):
