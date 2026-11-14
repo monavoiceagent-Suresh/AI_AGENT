@@ -7,7 +7,7 @@ import pytest
 from fastapi import WebSocketDisconnect
 
 from app.interfaces import CallAudio, CallEnded, PlaybackMark
-from app.providers.exotel import ExotelClient, ExotelError, ExotelMediaStream, chunk_size_for
+from app.providers.exotel import ExotelClient, ExotelError, ExotelMediaStream, ExotelSendError, chunk_size_for
 from tests.fakes import exotel_start
 
 pytestmark = pytest.mark.anyio
@@ -25,6 +25,22 @@ class FakeWebSocket:
 
     async def send_text(self, text: str) -> None:
         self.sent.append(json.loads(text))
+
+
+class FlakyWebSocket(FakeWebSocket):
+    """Raises `fail_with` from the `fail_on_call`-th send_text call; sends normally otherwise."""
+
+    def __init__(self, incoming: list[str], *, fail_with: Exception, fail_on_call: int = 1) -> None:
+        super().__init__(incoming)
+        self.fail_with = fail_with
+        self.fail_on_call = fail_on_call
+        self.send_calls = 0
+
+    async def send_text(self, text: str) -> None:
+        self.send_calls += 1
+        if self.send_calls == self.fail_on_call:
+            raise self.fail_with
+        await super().send_text(text)
 
 
 @pytest.mark.parametrize("rate,size", [(8000, 3200), (16000, 3200), (24000, 4800)])
@@ -56,6 +72,49 @@ async def test_start_and_inbound_events_are_parsed():
 async def test_socket_drop_reports_disconnect():
     media = ExotelMediaStream(FakeWebSocket([]), queue_max_ms=2000)
     assert [e async for e in media.events()] == [CallEnded("disconnected")]
+
+
+@pytest.mark.parametrize("fault", [OSError("broken pipe"), RuntimeError("websocket is closing")])
+async def test_a_transient_send_fault_now_raises_instead_of_being_dropped_silently(fault):
+    """Regression for the production bug: an OSError/RuntimeError on a socket not yet known to be closed
+    used to be swallowed with no log and no signal to the caller, so a dropped media/mark frame looked
+    identical to a successfully delivered one -- the caller heard silence with nothing in the logs to
+    explain why. It must now raise ExotelSendError so VoiceSession's response-failure handling can react."""
+    ws = FlakyWebSocket([exotel_start("CA1")], fail_with=fault)
+    media = ExotelMediaStream(ws, queue_max_ms=60_000)
+    await media.wait_start()
+
+    with pytest.raises(ExotelSendError):
+        await media.send_audio(bytes(3200))
+
+
+async def test_a_clean_disconnect_mid_send_is_still_swallowed_not_raised():
+    """A WebSocketDisconnect means the caller already hung up; events() already reports it, so raising
+    here too would be redundant -- this case alone is intentionally still silent (but logged)."""
+    ws = FlakyWebSocket([exotel_start("CA1")], fail_with=WebSocketDisconnect(1000))
+    media = ExotelMediaStream(ws, queue_max_ms=60_000)
+    await media.wait_start()
+
+    await media.send_audio(bytes(3200))  # does not raise
+
+
+async def test_a_transient_send_fault_on_mark_also_raises():
+    ws = FlakyWebSocket([exotel_start("CA1")], fail_with=OSError("broken pipe"))
+    media = ExotelMediaStream(ws, queue_max_ms=60_000)
+    await media.wait_start()
+
+    with pytest.raises(ExotelSendError):
+        await media.mark("1:1")
+
+
+async def test_clear_swallows_a_transient_send_fault_since_it_is_best_effort():
+    """clear() is fire-and-forget on barge-in: a dropped clear just leaves a little stale audio queued on
+    Exotel's side, and must never take the call down the way a dropped media/mark frame now does."""
+    ws = FlakyWebSocket([exotel_start("CA1")], fail_with=OSError("broken pipe"))
+    media = ExotelMediaStream(ws, queue_max_ms=60_000)
+    await media.wait_start()
+
+    await media.clear()  # does not raise
 
 
 async def test_outbound_audio_is_chunked_padded_and_marked():

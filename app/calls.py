@@ -542,7 +542,14 @@ async def run_call(
             asr, fallback_asr, language=agent.language, sample_rate=media.sample_rate
         ) as transcriber:
             session = VoiceSession(
-                config, media=media, asr=transcriber, llm=call_llm, tts=tts, fallback_tts=fallback_tts
+                config,
+                media=media,
+                asr=transcriber,
+                llm=call_llm,
+                tts=tts,
+                fallback_tts=fallback_tts,
+                call_id=call_id,
+                call_sid=start.call_sid,
             )
             end_reason = await session.run()
     except asyncio.CancelledError:

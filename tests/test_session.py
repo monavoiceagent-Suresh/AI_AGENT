@@ -319,3 +319,37 @@ async def test_tts_failure_without_a_fallback_does_not_end_the_call():
     assert not task.done()
     media.hang_up()
     assert await task == "caller:callended"
+
+
+class FailingSendMedia(FakeMedia):
+    """A media transport whose every send_audio call fails, standing in for the Exotel WebSocket send
+    failures that app/providers/exotel.py now raises as ExotelSendError instead of swallowing silently."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_attempts = 0
+
+    async def send_audio(self, pcm: bytes) -> None:
+        self.send_attempts += 1
+        raise RuntimeError("exotel send failed")
+
+
+async def test_media_send_failures_end_the_call_instead_of_going_silently_deaf():
+    """Reproduces the production symptom end to end: the LLM replies and TTS produces valid audio, but
+    every attempt to actually deliver it over the media transport fails. Before the exotel.py fix such a
+    failure was swallowed with no log and no signal, so the call would stay "connected" and the caller
+    would hear nothing for the rest of it. It must instead be treated like any other response failure:
+    an apology attempt (which also fails to be heard), counted against the consecutive-failure budget,
+    and the call ended deterministically rather than left silently open."""
+    media, asr = FailingSendMedia(), FakeASR()
+    config = SessionConfig(**{**CONFIG.__dict__, "max_consecutive_llm_failures": 2})
+    session = VoiceSession(config, media=media, asr=asr, llm=FakeLLM(["Sure, one moment."]), tts=FakeTTS())
+    task = asyncio.create_task(session.run())
+    await wait_for(lambda: media.send_attempts >= 1)  # the greeting failed to be delivered
+    asr.say("Hello?")
+
+    end_reason = await asyncio.wait_for(task, 5)
+
+    assert end_reason == "agent_ended"  # ended deterministically, not left "connected" and silent forever
+    assert session.turns == []  # no response's audio ever actually reached the caller
+    assert bytes(media.audio) == b""

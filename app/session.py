@@ -114,6 +114,8 @@ class VoiceSession:
         llm: LLM,
         tts: TTS,
         fallback_tts: TTS | None = None,
+        call_id: int | None = None,
+        call_sid: str = "",
     ):
         self.config = config
         self.media = media
@@ -121,6 +123,9 @@ class VoiceSession:
         self.llm = llm
         self.tts = tts
         self.fallback_tts = fallback_tts
+        # For correlating logs across the pipeline; cosmetic only, never used for control flow.
+        self.call_id = call_id
+        self.call_sid = call_sid
         self.history: list[dict[str, str]] = [{"role": "system", "content": config.system_prompt}]
         self.turns: list[dict[str, Any]] = []
         self.asr_bytes = 0
@@ -143,6 +148,15 @@ class VoiceSession:
     @property
     def asr_seconds(self) -> float:
         return self.asr_bytes / (2 * self.media.sample_rate)
+
+    def _ctx(self, response_id: int | None = None) -> str:
+        """call_id/call_sid/stream_sid/response_id as a log prefix, for correlating one failure across
+        the whole pipeline (LLM -> TTS -> media send)."""
+        stream_sid = getattr(self.media, "stream_sid", "") or "-"
+        parts = [f"call={self.call_id or '-'}", f"call_sid={self.call_sid or '-'}", f"stream={stream_sid}"]
+        if response_id is not None:
+            parts.append(f"response={response_id}")
+        return " ".join(parts)
 
     async def run(self) -> str:
         """Converse until the call ends; returns the end reason."""
@@ -215,7 +229,8 @@ class VoiceSession:
         self._last_activity = now
         letters = sum(ch.isalnum() for ch in text)
         if self.config.barge_in and self._responding() and letters >= MIN_BARGE_IN_CHARS:
-            log.info("barge-in: caller interrupted the agent")
+            response_id = self._response.id if self._response else None
+            log.info("%s: barge-in, caller interrupted the agent", self._ctx(response_id))
             await self._cancel_response()
             await self.media.clear()
 
@@ -296,12 +311,16 @@ class VoiceSession:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("response %s failed", response.id)
+            log.exception("%s: response failed", self._ctx(response.id))
             spoken = await self._apologise(response)
             self._finish_turn(response, interrupted=not spoken)
             self._consecutive_llm_failures += 1
             if self._consecutive_llm_failures >= self.config.max_consecutive_llm_failures:
-                log.warning("ending call after %d consecutive failed responses", self._consecutive_llm_failures)
+                log.warning(
+                    "%s: ending call after %d consecutive failed responses",
+                    self._ctx(response.id),
+                    self._consecutive_llm_failures,
+                )
                 self._hangup.set()
             return
         finally:
@@ -323,7 +342,7 @@ class VoiceSession:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("could not speak the fallback phrase")
+            log.exception("%s: could not speak the fallback phrase", self._ctx(response.id))
             return False
         return True
 
@@ -386,7 +405,11 @@ class VoiceSession:
                 # Falling back after audio has started would speak the sentence twice.
                 if produced or attempt == len(engines) - 1:
                     raise
-                log.warning("TTS provider failed before producing audio; trying the fallback", exc_info=True)
+                log.warning(
+                    "%s: TTS provider failed before producing audio; trying the fallback",
+                    self._ctx(response.id),
+                    exc_info=True,
+                )
         await self.media.flush_audio()
         response.sent.append(sentence)
         await self.media.mark(f"{response.id}:{len(response.sent)}")
@@ -398,7 +421,12 @@ class VoiceSession:
                     await response.marked.wait()
                     response.marked.clear()
         except TimeoutError:
-            log.warning("playback marks missing for response %s; assuming audio played", response.id)
+            log.warning(
+                "%s: playback marks missing (sent=%d played=%d); assuming audio played",
+                self._ctx(response.id),
+                len(response.sent),
+                response.played,
+            )
             response.played = len(response.sent)
 
     def _finish_turn(self, response: _Response, *, interrupted: bool) -> None:
@@ -406,15 +434,20 @@ class VoiceSession:
             self._response = None
         heard = response.sent[: response.played] if interrupted else response.sent
         log.debug(
-            "response %s done: interrupted=%s sent=%d played=%d",
-            response.id,
+            "%s: response done: interrupted=%s sent=%d played=%d",
+            self._ctx(response.id),
             interrupted,
             len(response.sent),
             response.played,
         )
         agent_text = " ".join(heard)
         if not agent_text:
-            # The caller heard nothing, so their words are still unanswered.
+            # The caller heard nothing, so their words are still unanswered. Expected when a barge-in or
+            # cancellation cut the response off before any audio went out; worth flagging otherwise, since
+            # a completed (non-interrupted) response with zero audio played is the "LLM replied, caller
+            # heard silence" failure mode.
+            log_fn = log.debug if interrupted else log.warning
+            log_fn("%s: caller heard no audio for this response (interrupted=%s)", self._ctx(response.id), interrupted)
             if response.user_text:
                 self._pending_user = _join(response.user_text, self._pending_user)
             return

@@ -36,6 +36,17 @@ class ExotelError(Exception):
         self.placement_unknown = placement_unknown
 
 
+class ExotelSendError(Exception):
+    """A media/mark frame could not be delivered over a stream not yet known to be closed.
+
+    Distinct from a clean WebSocketDisconnect (caller already hung up, nothing left to send): this is a
+    transport fault (broken pipe, write after half-close, ...) on a socket the rest of the pipeline still
+    believes is live. Raising it (instead of swallowing it, as before) lets VoiceSession's existing
+    response-failure handling (apology + consecutive-failure counting + eventual hangup) take over, rather
+    than the call silently going deaf for its remaining duration.
+    """
+
+
 @dataclass(frozen=True)
 class ExotelCallRecord:
     """What Exotel's own call record says about a call (GET /v1/Accounts/{sid}/Calls/{CallSid}.json)."""
@@ -205,6 +216,7 @@ class ExotelMediaStream:
         self._ws = ws
         self._queue_max = queue_max_ms / 1000
         self.stream_sid = ""
+        self.call_sid = ""
         self.sample_rate = 8000
         self._chunk_size = chunk_size_for(self.sample_rate)
         self._buffer = bytearray()
@@ -227,6 +239,7 @@ class ExotelMediaStream:
             }
             log.info("exotel stream start %s", json.dumps(diagnostics, sort_keys=True, default=str))
             self.stream_sid = start["stream_sid"]
+            self.call_sid = start["call_sid"]
             self.sample_rate = int(start.get("media_format", {}).get("sample_rate", 8000))
             self._chunk_size = chunk_size_for(self.sample_rate)
             return StreamStart(
@@ -287,7 +300,12 @@ class ExotelMediaStream:
     async def clear(self) -> None:
         self._buffer.clear()
         self._play_until = 0.0
-        await self._send({"event": "clear", "stream_sid": self.stream_sid})
+        try:
+            await self._send({"event": "clear", "stream_sid": self.stream_sid})
+        except ExotelSendError:
+            # Best-effort: a dropped clear leaves a little stale audio queued on Exotel's side, not a
+            # silent call, so it must never take the session down the way a dropped media/mark frame does.
+            pass
 
     def playback_remaining(self) -> float:
         return max(0.0, self._play_until - time.monotonic())
@@ -300,6 +318,18 @@ class ExotelMediaStream:
     async def _send(self, message: dict) -> None:
         try:
             await self._ws.send_text(json.dumps(message))
-        except (WebSocketDisconnect, RuntimeError, OSError):
+        except WebSocketDisconnect:
             # Caller hung up mid-send; events() reports the disconnect.
-            pass
+            log.info(
+                "exotel send skipped on a disconnected stream (call_sid=%s stream_sid=%s event=%s)",
+                self.call_sid, self.stream_sid, message.get("event"),
+            )
+        except (RuntimeError, OSError) as exc:
+            # A transport fault on a socket not yet known to be closed: silently dropping this (as before)
+            # left the rest of the pipeline believing audio played when it never reached the caller. Log it
+            # with full correlation context and raise so the caller (send_audio/flush_audio/mark) can react.
+            log.warning(
+                "exotel send failed (call_sid=%s stream_sid=%s event=%s): %s",
+                self.call_sid, self.stream_sid, message.get("event"), exc,
+            )
+            raise ExotelSendError(f"failed to send {message.get('event')!r} frame") from exc
