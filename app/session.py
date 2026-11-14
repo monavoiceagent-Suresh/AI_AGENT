@@ -367,6 +367,7 @@ class VoiceSession:
                     language=self.config.language,
                     sample_rate=self.media.sample_rate,
                     previous_text=previous_text,
+                    voice_settings=voice.settings,
                 ):
                     if not produced:
                         produced = True

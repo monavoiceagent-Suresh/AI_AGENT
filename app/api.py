@@ -304,13 +304,16 @@ async def place_test_call(body: TestCallIn, svc: Svc) -> CallDetail | DispatchOu
                 webhook_url=body.webhook_url,
                 voice_id=body.voice_id,
                 tts_model_id=body.tts_model_id,
+                voice_settings=body.voice_settings,
             ),
         )
     persona = body.persona
+    body_voice_settings = body.voice_settings.model_dump(exclude_none=True) if body.voice_settings else None
     speakable = AgentIn(
         **persona.model_dump(include=set(dispatch_db.PERSONA_FIELDS)),
         voice_id=body.voice_id,
         tts_model_id=body.tts_model_id,
+        voice_settings=body_voice_settings,
     )
     if problem := calls.validate_agent(speakable, svc.settings):
         raise HTTPException(422, f"Persona {persona.key!r} cannot be spoken by the voice engine: {problem}")
@@ -325,7 +328,13 @@ async def place_test_call(body: TestCallIn, svc: Svc) -> CallDetail | DispatchOu
     agent = Agent(**dict(await db.get_agent(svc.pool, agent_id)))
     try:
         call_id = await calls.place_outbound_call(
-            svc, agent, body.to, body.contact_name, voice_id=body.voice_id, tts_model_id=body.tts_model_id
+            svc,
+            agent,
+            body.to,
+            body.contact_name,
+            voice_id=body.voice_id,
+            tts_model_id=body.tts_model_id,
+            voice_settings=body_voice_settings,
         )
     except CallRejected as exc:
         raise HTTPException(409, str(exc)) from exc

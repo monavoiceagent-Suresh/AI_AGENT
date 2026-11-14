@@ -5,6 +5,7 @@ Redis is atomically rebuilt before admission; uncertainty always retains capacit
 import json
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Literal
 
 import asyncpg
@@ -162,12 +163,29 @@ class ChannelAllocator:
         return await self._pool.fetchval("SELECT count(*) FROM channel_allocations WHERE state != 'released'")
 
     async def reconcile_on_startup(self, exotel: ExotelClient) -> None:
-        """Conservatively reconcile all calls; no SID and provider errors retain capacity."""
+        """Conservatively reconcile all calls; provider errors retain capacity.
+
+        A reservation that never received a call_sid (its place_outbound_call / _resolve_inbound
+        coroutine threw, or was killed, before Exotel ever returned one — including the
+        placement-unknown path kept deliberately unreleased in app/calls.py) has nothing left that
+        will ever dial, fail, or release it: there is no call_sid for Exotel to confirm and no
+        `calls` row for abandon_stale_calls to match. Past allocation_reservation_seconds there is
+        nothing left to stay conservative about, so it is released here instead of held forever.
+        """
         rows = await self._pool.fetch(
-            "SELECT id, direction, call_sid FROM channel_allocations WHERE state != 'released'"
+            "SELECT id, direction, call_sid, reserved_at FROM channel_allocations WHERE state != 'released'"
         )
         for row in rows:
             if not row["call_sid"]:
+                age = (datetime.now(UTC) - row["reserved_at"]).total_seconds()
+                if age > self._settings.allocation_reservation_seconds:
+                    log.warning(
+                        "releasing allocation %s: no call_sid after %.0fs (reserved %s)",
+                        row["id"],
+                        age,
+                        row["direction"],
+                    )
+                    await self.release(row["id"])
                 continue
             try:
                 record = await exotel.get_call_record(row["call_sid"], wait_seconds=5.0)

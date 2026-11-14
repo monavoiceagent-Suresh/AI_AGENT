@@ -9,6 +9,8 @@ like test_dispatch.py's `run_now` helper — calling the pool directly from this
 loop fails with "attached to a different loop".
 """
 
+from datetime import UTC, datetime
+
 from app import dispatch_db
 from tests.test_api import ADMIN, EXOTEL_AUTH, client, converse  # noqa: F401
 from tests.test_dispatch import dispatch_body, ready, sink, start, wait_until  # noqa: F401
@@ -110,6 +112,39 @@ def test_single_slot_rotates_across_sustained_backlogs(client):  # noqa: F811
         client.portal.call(dispatch_db.release_lead, pool, lead["lead_pk"])
     assert all((picked[i] in a) != (picked[i + 1] in a) for i in range(7))
     assert set(picked).issubset(set(a + b))
+
+
+def test_release_lead_delays_the_next_attempt_instead_of_retrying_immediately(client):  # noqa: F811
+    """A lead rejected for lack of capacity must wait, not get reclaimed on the very next poll
+    tick: with no delay, release_lead left next_attempt_at unchanged and app/dispatch.py's
+    place_next_call busy-looped on the same lead every dispatcher_poll_seconds for as long as the
+    account stayed full — the reported ~90 retries in about 4 minutes."""
+    pool = client.app.state.services.pool
+    [lead_pk] = insert_job_with_leads(client, "tenant-a", "campaign-delay", ["+919876502001"])
+
+    assert client.portal.call(dispatch_db.claim_lead, pool, lead_pk)
+    client.portal.call(dispatch_db.release_lead, pool, lead_pk, 5.0)
+
+    row = client.portal.call(
+        pool.fetchrow, "SELECT status, next_attempt_at, attempts FROM dispatch_leads WHERE id = $1", lead_pk
+    )
+    assert row["status"] == "pending"
+    assert row["attempts"] == 0  # a capacity miss is not counted against the lead's max_tries
+    assert row["next_attempt_at"] > datetime.now(UTC)
+    assert client.portal.call(dispatch_db.next_due_lead, pool, True) is None  # not immediately due again
+
+
+def test_release_lead_with_no_delay_keeps_the_existing_immediate_retry_contract(client):  # noqa: F811
+    """Default delay_seconds=0 preserves every existing caller/test that releases a lead without
+    asking for a wait (e.g. test_single_slot_rotates_across_sustained_backlogs above)."""
+    pool = client.app.state.services.pool
+    [lead_pk] = insert_job_with_leads(client, "tenant-a", "campaign-no-delay", ["+919876502002"])
+
+    assert client.portal.call(dispatch_db.claim_lead, pool, lead_pk)
+    client.portal.call(dispatch_db.release_lead, pool, lead_pk)
+
+    picked = client.portal.call(dispatch_db.next_due_lead, pool, True)
+    assert picked is not None and picked["lead_pk"] == lead_pk
 
 
 def test_suspended_tenant_is_excluded_from_queued_dispatch(client):  # noqa: F811

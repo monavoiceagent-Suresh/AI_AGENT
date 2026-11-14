@@ -198,10 +198,10 @@ async def test_reconcile_releases_a_call_exotel_reports_already_ended(allocator)
     assert row["state"] == "released"
 
 
-async def test_reconcile_retains_a_reservation_with_no_call_sid(allocator):
-    """A reserved allocation with no call_sid can only mean its own place_outbound_call /
-    _resolve_inbound coroutine was killed by this very restart — nothing will ever dial, fail, or
-    release it on its own, however recently it was reserved, so reconcile must not keep it."""
+async def test_reconcile_retains_a_fresh_reservation_with_no_call_sid(allocator):
+    """A reservation that only just started (e.g. place_outbound_call is between reserve() and the
+    Exotel call) has not yet had a fair chance to receive its call_sid; reconcile must not release
+    it before allocation_reservation_seconds (the fixture's grace period: 1 second) has passed."""
     allocation_id = new_id()
     await allocator._pool.execute(
         "INSERT INTO channel_allocations (id, direction, call_sid, state) VALUES ($1, 'outbound', NULL, 'reserved')",
@@ -213,6 +213,27 @@ async def test_reconcile_retains_a_reservation_with_no_call_sid(allocator):
     assert await allocator.occupied() == 1
     row = await allocator._pool.fetchrow("SELECT state FROM channel_allocations WHERE id = $1", allocation_id)
     assert row["state"] == "reserved"
+
+
+async def test_reconcile_releases_a_stale_reservation_with_no_call_sid(allocator):
+    """A reserved allocation whose call_sid never arrived (its place_outbound_call /
+    _resolve_inbound coroutine was killed by a restart, or threw before Exotel ever answered — the
+    placement-unknown path in app/calls.py deliberately leaves it unreleased there) has nothing
+    left that will ever dial, fail, or release it: no call_sid for Exotel to confirm and no `calls`
+    row for abandon_stale_calls to match. Past the grace period, reconcile must release it instead
+    of holding it forever (the leak behind repeated "Concurrent call limit reached" rejections)."""
+    allocation_id = new_id()
+    await allocator._pool.execute(
+        "INSERT INTO channel_allocations (id, direction, call_sid, state, reserved_at) "
+        "VALUES ($1, 'outbound', NULL, 'reserved', now() - interval '10 seconds')",
+        allocation_id,
+    )
+
+    await allocator.reconcile_on_startup(FakeExotel({}))
+
+    assert await allocator.occupied() == 0
+    row = await allocator._pool.fetchrow("SELECT state FROM channel_allocations WHERE id = $1", allocation_id)
+    assert row["state"] == "released"
 
 
 async def test_redis_loss_cannot_admit_over_the_durable_limit(allocator):

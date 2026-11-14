@@ -92,8 +92,9 @@ async def create_job(pool: asyncpg.Pool, request: DispatchIn) -> str:
             agent_id = await upsert_persona_agent(conn, request.client_id, request.persona)
             job_id = await conn.fetchval(
                 "INSERT INTO dispatch_jobs (idempotency_key, client_id, campaign_id, agent_id, status, window_start, "
-                "window_end, max_tries, retry_gap_minutes, webhook_url, persona, voice_id, tts_model_id, caller_id) "
-                "VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+                "window_end, max_tries, retry_gap_minutes, webhook_url, persona, voice_id, tts_model_id, caller_id, "
+                "voice_settings) "
+                "VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
                 request.idempotency_key,
                 request.client_id,
                 request.campaign_id,
@@ -107,6 +108,7 @@ async def create_job(pool: asyncpg.Pool, request: DispatchIn) -> str:
                 request.voice_id,
                 request.tts_model_id,
                 request.caller_id,
+                request.voice_settings.model_dump(exclude_none=True) if request.voice_settings else None,
             )
             await conn.executemany(
                 "INSERT INTO dispatch_leads (job_id, lead_id, phone, name, next_attempt_at, attempts) "
@@ -171,7 +173,7 @@ async def next_due_lead(pool: asyncpg.Pool, enforcing: bool) -> asyncpg.Record |
         "    JOIN dispatch_jobs j2 ON j2.id = l2.job_id WHERE l2.status = 'calling' GROUP BY j2.client_id"
         ") "
         "SELECT l.id AS lead_pk, l.lead_id, l.phone, l.name, l.attempts, j.id AS job_id, j.status AS job_status, "
-        "j.agent_id, j.max_tries, j.retry_gap_minutes, j.voice_id, j.tts_model_id, j.caller_id "
+        "j.agent_id, j.max_tries, j.retry_gap_minutes, j.voice_id, j.tts_model_id, j.voice_settings, j.caller_id "
         "FROM dispatch_leads l JOIN dispatch_jobs j ON j.id = l.job_id "
         "LEFT JOIN tenant_load t ON t.client_id = j.client_id "
         "LEFT JOIN tenants tenant ON tenant.id = j.client_id "
@@ -198,12 +200,20 @@ async def claim_lead(pool: asyncpg.Pool, lead_pk: int) -> bool:
     return claimed is not None
 
 
-async def release_lead(pool: asyncpg.Pool, lead_pk: int) -> None:
-    """Undo a claim when the call could not be placed for lack of capacity."""
+async def release_lead(pool: asyncpg.Pool, lead_pk: int, delay_seconds: float = 0.0) -> None:
+    """Undo a claim when the call could not be placed (e.g. for lack of capacity).
+
+    `delay_seconds` holds the lead off `next_due_lead` for a short while instead of letting it
+    become due again immediately: without it, a lead rejected only for lack of capacity is
+    reclaimed and rejected again on every dispatcher poll until a slot frees up, turning a bounded
+    wait into a tight reserve/reject busy-loop. GREATEST never moves next_attempt_at earlier.
+    """
     await pool.execute(
-        "UPDATE dispatch_leads SET status = 'pending', attempts = attempts - 1, claimed_at = NULL "
+        "UPDATE dispatch_leads SET status = 'pending', attempts = attempts - 1, claimed_at = NULL, "
+        "next_attempt_at = GREATEST(next_attempt_at, now() + make_interval(secs => $2)) "
         "WHERE id = $1 AND status = 'calling'",
         lead_pk,
+        delay_seconds,
     )
 
 

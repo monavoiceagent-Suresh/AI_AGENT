@@ -37,8 +37,9 @@ TTS_PROVIDER_LANGUAGES: dict[TTSProvider, set[str] | None] = {
 }
 
 
-# Exotel rings the callee for this long; an unanswered reservation expires shortly after
-# (Settings.allocation_reservation_seconds, enforced inside the allocator's own Lua script).
+# Exotel rings the callee for this long. An unanswered reservation never expires on a timer by
+# itself (reservations only release on terminal proof) except when it never received a call_sid at
+# all, which the allocator's reconcile sweep bounds by Settings.allocation_reservation_seconds.
 RING_TIMEOUT_SECONDS = 45
 # Pause before the second read of Exotel's record of a call that has only just connected.
 LOOKUP_RETRY_SECONDS = 0.5
@@ -243,11 +244,16 @@ def session_config(agent: Agent, settings: Settings, caller_context: str) -> Ses
     )
 
 
-def with_call_voice(agent: Agent, voice_id: str | None, tts_model_id: str | None) -> Agent:
+def with_call_voice(
+    agent: Agent, voice_id: str | None, tts_model_id: str | None, voice_settings: dict | None = None
+) -> Agent:
     """The voice this call was placed with, on its own copy of the agent; the agent's voice when none was chosen."""
     if not (voice_id and tts_model_id):
         return agent
-    return agent.model_copy(update={"voice_id": voice_id, "tts_model_id": tts_model_id})
+    update = {"voice_id": voice_id, "tts_model_id": tts_model_id}
+    if voice_settings:
+        update["voice_settings"] = voice_settings
+    return agent.model_copy(update=update)
 
 
 def with_persona(agent: Agent, persona: dict) -> Agent:
@@ -278,6 +284,7 @@ async def place_outbound_call(
     *,
     voice_id: str | None = None,
     tts_model_id: str | None = None,
+    voice_settings: dict | None = None,
     caller_id: str | None = None,
 ) -> int:
     from app import tenants
@@ -331,6 +338,7 @@ async def place_outbound_call(
             dispatch_lead_id,
             voice_id=voice_id,
             tts_model_id=tts_model_id,
+            voice_settings=voice_settings,
         )
     except Exception:
         # The callee's phone is already ringing with no row to answer it from: make that findable.
@@ -376,7 +384,7 @@ async def resolve_agent(svc: Services, start: StreamStart) -> Resolved:
                 campaign_id = job["campaign_id"]
                 if job["persona"]:
                     agent = with_persona(agent, job["persona"])
-        agent = with_call_voice(agent, call["voice_id"], call["tts_model_id"])
+        agent = with_call_voice(agent, call["voice_id"], call["tts_model_id"], call["voice_settings"])
         return Resolved(agent, call["id"], prompts.caller_context("outbound", call["contact_name"]), start, campaign_id)
     return await _resolve_inbound(svc, start)
 

@@ -166,7 +166,12 @@ async def test_dispatch_emits_started_with_existing_tenant_job_and_caller_id(mon
     enqueue = AsyncMock()
     monkeypatch.setattr(dispatch_db, "enqueue_event", enqueue)
     assert await dispatch.place_next_call(svc)
-    assert placed.call_args.kwargs == {"voice_id": "voice", "tts_model_id": "m1", "caller_id": None}
+    assert placed.call_args.kwargs == {
+        "voice_id": "voice",
+        "tts_model_id": "m1",
+        "voice_settings": None,
+        "caller_id": None,
+    }
     event = enqueue.call_args.args[2]
     assert event["engineJobId"] == "engine-job" and event["eventType"] == "call.started"
     assert event["data"]["engineCallId"] == "42"

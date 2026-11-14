@@ -129,11 +129,12 @@ async def create_outbound_call(
     dispatch_lead_id: int | None = None,
     voice_id: str | None = None,
     tts_model_id: str | None = None,
+    voice_settings: dict | None = None,
 ) -> int:
     return await pool.fetchval(
         "INSERT INTO calls (agent_id, direction, exotel_call_sid, from_number, to_number, contact_name, status, "
-        "dispatch_lead_id, voice_id, tts_model_id) VALUES ($1, 'outbound', $2, $3, $4, $5, 'initiated', $6, $7, $8) "
-        "RETURNING id",
+        "dispatch_lead_id, voice_id, tts_model_id, voice_settings) "
+        "VALUES ($1, 'outbound', $2, $3, $4, $5, 'initiated', $6, $7, $8, $9) RETURNING id",
         agent_id,
         call_sid,
         from_number,
@@ -142,6 +143,7 @@ async def create_outbound_call(
         dispatch_lead_id,
         voice_id,
         tts_model_id,
+        voice_settings,
     )
 
 

@@ -34,6 +34,11 @@ MAX_PARALLEL_DELIVERIES = 8
 RETRYABLE_CLIENT_ERRORS = frozenset({408, 425, 429})
 # A connected call whose outcome means nobody was really reached is attempted again.
 RETRY_OUTCOMES = frozenset({"no_conversation"})
+# How long a lead waits before being reconsidered after a placement rejection (e.g. capacity
+# exhausted), instead of being reclaimed on the very next poll tick. Deliberately just over one
+# dispatcher_poll_seconds: enough to turn a tight reserve/reject busy-loop into one retry per
+# cycle, without delaying recovery once capacity actually frees up.
+CAPACITY_RETRY_DELAY_SECONDS = 1.0
 
 
 def _rejected(reason: str) -> DispatchOut:
@@ -59,6 +64,7 @@ async def accept(svc: Services, request: DispatchIn) -> DispatchOut:
         **persona.model_dump(include=set(dispatch_db.PERSONA_FIELDS)),
         voice_id=request.voice_id,
         tts_model_id=request.tts_model_id,
+        voice_settings=request.voice_settings.model_dump(exclude_none=True) if request.voice_settings else None,
     )
     if problem := calls.validate_agent(speakable, svc.settings):
         return _rejected(f"Persona {persona.key!r} cannot be spoken by the voice engine: {problem}")
@@ -200,14 +206,20 @@ async def place_next_call(svc: Services) -> bool:
             lead["lead_pk"],
             voice_id=lead["voice_id"],
             tts_model_id=lead["tts_model_id"],
+            voice_settings=lead.get("voice_settings"),
             caller_id=lead.get("caller_id"),
         )
     except CallRejected as exc:
         # Released, not failed: a transient rejection (e.g. capacity) should let the next poll
         # retry it. Logged so a tenant that will reject on every retry (e.g. unrecognized at the
         # enforced outbound-admission gate in calls.place_outbound_call) doesn't stall silently.
-        log.warning("lead %s not placed, releasing for retry: %s", lead["lead_id"], exc)
-        await dispatch_db.release_lead(svc.pool, lead["lead_pk"])
+        log.warning(
+            "lead %s not placed, releasing for retry in %.0fs: %s",
+            lead["lead_id"],
+            CAPACITY_RETRY_DELAY_SECONDS,
+            exc,
+        )
+        await dispatch_db.release_lead(svc.pool, lead["lead_pk"], CAPACITY_RETRY_DELAY_SECONDS)
         return False
     except ExotelError as exc:
         log.warning("could not dial lead %s: %s", lead["lead_id"], exc)
