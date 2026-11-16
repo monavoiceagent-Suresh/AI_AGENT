@@ -115,11 +115,13 @@ class ExotelClient:
             if parsed.netloc.lower() != host:
                 return None
             api_host = host in {"api.exotel.com", "api.in.exotel.com"} and url.startswith(self._base_url + "/")
+            recordings_host = host in {"recordings.exotel.com", "recordings.in.exotel.com"}
             s3_host = re.fullmatch(r"(?:[a-z0-9.-]+\.)?s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com", host)
-            if not api_host and not s3_host:
+            if not api_host and not recordings_host and not s3_host:
                 return None
+            authed_host = api_host or recordings_host
             request = self._http.build_request("GET", url, timeout=10)
-            response = await self._http.send(request, stream=True, auth=self._auth if api_host else None,
+            response = await self._http.send(request, stream=True, auth=self._auth if authed_host else None,
                                              follow_redirects=False)
             content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
             if response.status_code == 200 and (content_type.startswith("audio/") or content_type == "application/octet-stream"):
