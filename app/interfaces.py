@@ -81,9 +81,19 @@ class LLMUsage:
         )
 
 
+@dataclass(frozen=True)
+class LLMServed:
+    """Which provider/model actually produced a reply, yielded once before its first text. `role` is
+    "primary" or "fallback" when the failover layer chose it, "-" otherwise."""
+
+    provider: str
+    model: str
+    role: str = "-"
+
+
 class LLM(Protocol):
-    def stream(self, messages: list[dict[str, str]], model: str) -> AsyncIterator[str | LLMUsage]:
-        """Yield text deltas, then a final LLMUsage."""
+    def stream(self, messages: list[dict[str, str]], model: str) -> AsyncIterator[str | LLMUsage | LLMServed]:
+        """Yield text deltas (optionally preceded by one LLMServed), then a final LLMUsage."""
 
     async def complete(self, messages: list[dict[str, str]], model: str) -> tuple[str, LLMUsage]: ...
 

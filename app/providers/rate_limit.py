@@ -17,6 +17,10 @@ class TokenBucket:
         self._window_start = clock()
         self._count = 0
 
+    @property
+    def max_per_minute(self) -> int:
+        return self._max
+
     def try_acquire(self) -> bool:
         """Count one request against the current minute; False if that would exceed the budget."""
         if self._max <= 0:

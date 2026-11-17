@@ -18,6 +18,7 @@ import httpx
 from app import calls, db, dispatch_db, tenants
 from app.calls import CallRejected, Services
 from app.models import Agent, AgentIn, DispatchIn, DispatchOut
+from app.phone import indian_number_problem, normalize_phone
 from app.providers.exotel import ExotelError
 
 log = logging.getLogger(__name__)
@@ -34,6 +35,8 @@ MAX_PARALLEL_DELIVERIES = 8
 RETRYABLE_CLIENT_ERRORS = frozenset({408, 425, 429})
 # A connected call whose outcome means nobody was really reached is attempted again.
 RETRY_OUTCOMES = frozenset({"no_conversation"})
+# Mona's own label (src/lib/outcomes.ts), so it is shown as-is: a lead whose number can never be dialled.
+INVALID_NUMBER_OUTCOME = "Invalid number"
 # How long a lead waits before being reconsidered after a placement rejection (e.g. capacity
 # exhausted), instead of being reclaimed on the very next poll tick. Deliberately just over one
 # dispatcher_poll_seconds: enough to turn a tight reserve/reject busy-loop into one retry per
@@ -78,6 +81,14 @@ async def accept(svc: Services, request: DispatchIn) -> DispatchOut:
     return DispatchOut(engine_job_id=job_id, status="accepted")
 
 
+def lead_number_problem(phone: str) -> str | None:
+    """Why a lead's number cannot be dialled (None when it can): checked before Exotel is ever asked."""
+    digits = normalize_phone(phone)
+    if digits is None:
+        return "not a dialable phone number"
+    return indian_number_problem(f"+{digits}")
+
+
 def decide(
     attempt: Mapping[str, Any], *, connected: bool, outcome: str, now: datetime
 ) -> tuple[str, str, datetime | None]:
@@ -99,6 +110,7 @@ async def settle_attempt(
     connected: bool,
     outcome: str,
     seconds: float,
+    failure_reason: str | None = None,
 ) -> None:
     now = datetime.now(UTC)
     status, lead_state, next_attempt_at = decide(attempt, connected=connected, outcome=outcome, now=now)
@@ -117,6 +129,8 @@ async def settle_attempt(
             data["transcriptRef"] = str(call_id)  # an opaque key, not a link; see app/reporting.py
     if next_attempt_at is not None:
         data["nextAttemptAt"] = next_attempt_at.isoformat()
+    if failure_reason:
+        data["failureReason"] = failure_reason[:300]
     event = {
         "eventId": str(uuid.uuid4()),
         "eventType": "call.completed" if connected else "call.failed",
@@ -171,6 +185,8 @@ async def settle_finished_calls(svc: Services) -> None:
         if connected:
             outcome = row["outcome"] or "completed"
         else:
+            # Exotel's no_answer/busy/failed/canceled; "not_connected" when Exotel completed the call but no media
+            # stream ever reached the engine; "stream_failed" when one arrived but could not be started.
             outcome = "not_connected" if row["call_status"] == "completed" else row["call_status"]
         await settle_attempt(
             svc,
@@ -196,6 +212,18 @@ async def place_next_call(svc: Services) -> bool:
     if lead is None or not await dispatch_db.claim_lead(svc.pool, lead["lead_pk"]):
         return False
     attempt = {**lead, "attempts": lead["attempts"] + 1}
+    if problem := lead_number_problem(lead["phone"]):
+        log.warning("lead %s not dialled: invalid number (%s)", lead["lead_id"], problem)
+        await settle_attempt(
+            svc,
+            {**attempt, "max_tries": attempt["attempts"]},  # retrying can never fix the number
+            call_id=None,
+            connected=False,
+            outcome=INVALID_NUMBER_OUTCOME,
+            seconds=0.0,
+            failure_reason=problem,
+        )
+        return True
     agent = Agent(**dict(await db.get_agent(svc.pool, lead["agent_id"])))
     try:
         call_id = await calls.place_outbound_call(
@@ -231,6 +259,7 @@ async def place_next_call(svc: Services) -> bool:
             connected=False,
             outcome="placement_unknown" if unknown else "dial_failed",
             seconds=0.0,
+            failure_reason=str(exc),
         )
         return True
     await dispatch_db.mark_job_running(svc.pool, lead["job_id"])

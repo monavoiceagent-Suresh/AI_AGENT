@@ -31,9 +31,9 @@ def test_callback_accepts_required_fields_and_maps_no_answer(callback_client, en
         encoding: fields
     }
     assert client.post("/exotel/status", params={"token": "test-hook"}, **body).json() == {"ok": True}
-    query, call_sid, status = execute.await_args.args
+    query, call_sid, status, end_reason = execute.await_args.args
     assert "status = 'initiated'" in query
-    assert (call_sid, status) == ("CA-test", "no_answer")
+    assert (call_sid, status, end_reason) == ("CA-test", "no_answer", "exotel:no_answer")
 
 
 def test_callback_auth_and_missing_required_field(callback_client):

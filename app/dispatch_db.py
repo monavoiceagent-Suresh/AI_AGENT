@@ -32,6 +32,7 @@ PERSONA_FIELDS = (
     "llm_provider",
     "llm_fallback_provider",
     "llm_model",
+    "llm_fallback_model",
 )
 # These default to None on both AgentIn and PersonaIn, so a persona JSON blob saved before they existed
 # (an old route or job) simply has none chosen, exactly like a fresh one with no override at all.
@@ -44,6 +45,7 @@ PERSONA_OPTIONAL_FIELDS = frozenset(
         "llm_provider",
         "llm_fallback_provider",
         "llm_model",
+        "llm_fallback_model",
     }
 )
 
@@ -62,8 +64,8 @@ async def upsert_persona_agent(conn: asyncpg.Connection, client_id: str, persona
     return await conn.fetchval(
         "INSERT INTO agents (name, language, workflow, instructions, greeting, knowledge, outcome_rules, "
         "outcome_fallback, asr_provider, asr_fallback_provider, tts_provider, tts_fallback_provider, "
-        "llm_provider, llm_fallback_provider, llm_model, client_id, persona_key) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) "
+        "llm_provider, llm_fallback_provider, llm_model, llm_fallback_model, client_id, persona_key) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) "
         "ON CONFLICT (client_id, persona_key) WHERE persona_key IS NOT NULL DO UPDATE SET "
         "name = EXCLUDED.name, workflow = EXCLUDED.workflow, instructions = EXCLUDED.instructions, "
         "greeting = EXCLUDED.greeting, knowledge = EXCLUDED.knowledge, "
@@ -71,7 +73,7 @@ async def upsert_persona_agent(conn: asyncpg.Connection, client_id: str, persona
         "asr_provider = EXCLUDED.asr_provider, asr_fallback_provider = EXCLUDED.asr_fallback_provider, "
         "tts_provider = EXCLUDED.tts_provider, tts_fallback_provider = EXCLUDED.tts_fallback_provider, "
         "llm_provider = EXCLUDED.llm_provider, llm_fallback_provider = EXCLUDED.llm_fallback_provider, "
-        "llm_model = EXCLUDED.llm_model, "
+        "llm_model = EXCLUDED.llm_model, llm_fallback_model = EXCLUDED.llm_fallback_model, "
         "voice_id = CASE WHEN agents.language <> EXCLUDED.language THEN NULL ELSE agents.voice_id END, "
         "tts_model_id = CASE WHEN agents.language <> EXCLUDED.language THEN NULL ELSE agents.tts_model_id END, "
         "language = EXCLUDED.language, updated_at = now() RETURNING id",
@@ -90,6 +92,7 @@ async def upsert_persona_agent(conn: asyncpg.Connection, client_id: str, persona
         persona.llm_provider,
         persona.llm_fallback_provider,
         persona.llm_model,
+        persona.llm_fallback_model,
         client_id,
         persona.key,
     )

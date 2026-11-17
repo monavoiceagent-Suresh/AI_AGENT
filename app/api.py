@@ -112,8 +112,19 @@ async def list_voices(
 
 @admin.get("/llm/options")
 async def llm_options(svc: Svc) -> dict:
-    """The LLM providers this engine has keys for, and the models each offers, for the Super Admin's LLM form."""
+    """OpenRouter's compatible models and the engine's default primary/fallback, for the Super Admin's LLM form."""
     return await llm_models.llm_options(svc.http, svc.settings)
+
+
+@admin.post("/llm/validate")
+async def llm_validate(
+    svc: Svc,
+    primary_model: Annotated[str | None, Body(alias="primaryModel", max_length=200)] = None,
+    fallback_model: Annotated[str | None, Body(alias="fallbackModel", max_length=200)] = None,
+) -> dict:
+    """Whether a primary/fallback OpenRouter model pair can serve calls; the dashboard refuses to save one that
+    cannot. Null means the engine's default for that role."""
+    return await llm_models.validate_pair(svc.http, svc.settings, primary_model, fallback_model)
 
 
 @admin.get("/agents")
@@ -485,13 +496,26 @@ async def exotel_stream(ws: WebSocket) -> None:
     await ws.accept()
     log.info("exotel stream request %s", json.dumps(stream_request_summary(ws), sort_keys=True))
     media = ExotelMediaStream(ws, queue_max_ms=svc.settings.audio_queue_max_ms)
+    start = None
     try:
         async with asyncio.timeout(10):
             start = await media.wait_start()
         resolved = await calls.resolve_agent(svc, start)
     except (TimeoutError, WebSocketDisconnect, CallRejected) as exc:
-        log.warning("media stream not started: %s", exc or type(exc).__name__)
+        reason = f"stream_failed:{type(exc).__name__}"
+        log.warning(
+            "media stream not started call_sid=%s reason=%s: %s",
+            start.call_sid if start else "-", reason, exc or type(exc).__name__,
+        )
         await media.close()
+        if start is not None:
+            await _record_stream_failure(svc, start.call_sid, reason)
+        return
+    except Exception as exc:
+        log.exception("media stream setup failed call_sid=%s", start.call_sid if start else "-")
+        await media.close()
+        if start is not None:
+            await _record_stream_failure(svc, start.call_sid, f"stream_failed:{type(exc).__name__}")
         return
     await calls.run_call(
         svc,
@@ -502,3 +526,13 @@ async def exotel_stream(ws: WebSocket) -> None:
         resolved.caller_context,
         campaign_id=resolved.campaign_id,
     )
+
+
+async def _record_stream_failure(svc: Services, call_sid: str, reason: str) -> None:
+    """An outbound call Exotel connected whose media stream could not start: a traceable terminal state for its
+    row (dispatch then reports it as a connection failure and retries it), instead of a row left 'initiated'."""
+    try:
+        if await db.mark_stream_failed(svc.pool, call_sid, reason):
+            log.warning("call %s recorded as stream_failed (%s)", call_sid, reason)
+    except Exception:
+        log.exception("could not record the stream failure of call %s", call_sid)

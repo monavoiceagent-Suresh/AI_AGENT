@@ -208,7 +208,7 @@ async def test_the_call_ends_after_too_many_consecutive_failed_responses():
 
     end_reason = await asyncio.wait_for(task, 5)
 
-    assert end_reason == "agent_ended"  # the agent hung up itself instead of trying forever
+    assert end_reason == "response_failures"  # the agent hung up itself instead of trying forever, and says why
     assert len(llm.requests) == 2  # exactly the configured limit of attempts, not an unbounded number
     assert session.turns[-1]["agent_text"] == "Sorry, say that again?"
 
@@ -350,6 +350,6 @@ async def test_media_send_failures_end_the_call_instead_of_going_silently_deaf()
 
     end_reason = await asyncio.wait_for(task, 5)
 
-    assert end_reason == "agent_ended"  # ended deterministically, not left "connected" and silent forever
+    assert end_reason == "response_failures"  # ended deterministically, not left "connected" and silent forever
     assert session.turns == []  # no response's audio ever actually reached the caller
     assert bytes(media.audio) == b""

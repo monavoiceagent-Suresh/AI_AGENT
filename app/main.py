@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager, suppress
 
 import httpx
@@ -72,6 +73,7 @@ def build_tts_providers(http: httpx.AsyncClient, settings) -> dict:
             api_key=settings.elevenlabs_api_key.get_secret_value(),
             stability=settings.elevenlabs_tts_stability,
             similarity_boost=settings.elevenlabs_tts_similarity_boost,
+            read_timeout_s=settings.tts_timeout_ms / 1000,
         )
         if settings.elevenlabs_tts_voice_id
         else None
@@ -109,25 +111,48 @@ def build_asr_providers(settings) -> dict:
     return {"elevenlabs_scribe": scribe, "deepgram_nova3": deepgram}
 
 
-def build_llm(http: httpx.AsyncClient, settings) -> FailoverLLM:
-    """LLM_PROVIDER answers first; the other provider is the automatic fallback when its key is set."""
-    primary_name = settings.llm_provider
-    fallback_name = "openrouter" if primary_name == "groq" else "groq"
-    fallback_key = settings.openrouter_api_key if fallback_name == "openrouter" else settings.groq_api_key
-    fallback = _llm_client(http, settings, fallback_name, primary=False) if fallback_key is not None else None
-    fallback_model = settings.openrouter_model if fallback_name == "openrouter" else settings.groq_model
-    log.info("LLM primary: %s; fallback: %s", primary_name, fallback_name if fallback else "none")
+def build_openrouter(http: httpx.AsyncClient, settings) -> ChatCompletionsLLM:
+    """The one OpenRouter client every call shares: its per-model 429 cooldowns and self-throttle are therefore
+    real process-wide budgets, while a limit on one model never blocks calls using another."""
+    return _llm_client(http, settings, "openrouter", primary=True)
+
+
+def failover_for(client: ChatCompletionsLLM, settings, fallback_model: str | None) -> FailoverLLM:
+    """Primary model, then `fallback_model` on the same OpenRouter client, inside one response deadline. The
+    primary gets the primary's timeout and no retry (so the fallback gets its turn quickly); the fallback has
+    nothing behind it, so it gets the longer timeout and one retry with backoff and jitter."""
+    explicit_timeout = settings.openrouter_timeout_ms
+    explicit_retries = settings.openrouter_max_retries
     return FailoverLLM(
-        primary=_llm_client(http, settings, primary_name, primary=True),
-        fallback=fallback,
+        primary=client,
+        fallback=client if fallback_model else None,
         fallback_model=fallback_model or "",
+        primary_timeout_s=(explicit_timeout or PRIMARY_TIMEOUT_MS) / 1000,
+        primary_retries=PRIMARY_RETRIES if explicit_retries is None else explicit_retries,
+        fallback_timeout_s=(explicit_timeout or FALLBACK_TIMEOUT_MS) / 1000,
+        fallback_retries=FALLBACK_RETRIES if explicit_retries is None else explicit_retries,
+        deadline_s=settings.llm_response_deadline_ms / 1000,
     )
+
+
+def build_llm(http: httpx.AsyncClient, settings) -> FailoverLLM:
+    """The engine-wide default: OPENROUTER_MODEL, then LLM_FALLBACK_MODEL, both on OpenRouter."""
+    fallback_model = settings.llm_fallback_model
+    if fallback_model == settings.openrouter_model:
+        log.warning("LLM_FALLBACK_MODEL equals OPENROUTER_MODEL (%s): there is no LLM fallback", fallback_model)
+        fallback_model = None
+    log.info("LLM primary: openrouter/%s; fallback: %s", settings.openrouter_model,
+             f"openrouter/{fallback_model}" if fallback_model else "none")
+    return failover_for(build_openrouter(http, settings), settings, fallback_model)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # stdout, not stderr: Railway labels every stderr line "error", which hid the real severity of each line.
+    logging.basicConfig(
+        level=settings.log_level, stream=sys.stdout, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     # HTTP client request logs include full URLs, including signed recording query strings.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -180,10 +205,9 @@ async def lifespan(app: FastAPI):
         fallback_asr=fallback_asr,
         asr_by_provider=asr_by_provider,
         llm=llm,
-        llm_by_provider={
-            name: (_llm_client(http, settings, name, primary=True) if settings.llm_credentials_present(name) else None)
-            for name in ("openrouter", "groq")
-        },
+        # OpenRouter only: the same shared client the engine-wide default uses (resolve_llm builds each call's
+        # own primary/fallback model pair on it).
+        llm_by_provider={"openrouter": llm._primary, "groq": None},
         tts=primary_tts,
         fallback_tts=fallback_tts,
         tts_by_provider=tts_by_provider,

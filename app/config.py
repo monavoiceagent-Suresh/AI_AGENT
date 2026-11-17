@@ -6,6 +6,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.interfaces import Voice
 
+# eleven_v3 is not allowed (latency and cost); whatever chose it gets the default model instead.
+DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+DISALLOWED_TTS_MODELS = frozenset({"eleven_v3"})
+
+
+def normalize_tts_model(model_id: str | None) -> str | None:
+    """The TTS model to actually use for `model_id`: itself, or the default if it is a disallowed model."""
+    if model_id in DISALLOWED_TTS_MODELS:
+        return DEFAULT_ELEVENLABS_MODEL
+    return model_id
+
+
 TTSProvider = Literal["bakbak", "elevenlabs_premium", "elevenlabs_standard", "deepgram_aura"]
 ASRProvider = Literal["elevenlabs_scribe", "deepgram_nova3"]
 LLMProvider = Literal["openrouter", "groq"]
@@ -39,9 +51,11 @@ class Settings(BaseSettings):
 
     elevenlabs_api_key: SecretStr
     elevenlabs_asr_model_id: str = "scribe_v2_realtime"
-    # Standard (low-latency) tier model; Telugu is not covered by Flash, only by the Premium tier (eleven_v3).
+    # Both ElevenLabs tiers default to Flash v2.5 (lowest latency and cost). eleven_multilingual_v2 is the optional
+    # alternative a campaign or agent may choose explicitly. eleven_v3 is not allowed (latency/cost; not meant for
+    # real-time): a configured eleven_v3 is replaced by Flash v2.5. Note no allowed model speaks Telugu.
     elevenlabs_tts_model_id: str = "eleven_flash_v2_5"
-    elevenlabs_premium_model_id: str = "eleven_v3"
+    elevenlabs_premium_model_id: str = "eleven_flash_v2_5"
     # Needed only when ElevenLabs is a configured TTS provider (primary or fallback, either tier).
     elevenlabs_tts_voice_id: str = ""
     elevenlabs_tts_stability: float = 0.5
@@ -64,7 +78,8 @@ class Settings(BaseSettings):
     # list them with GET {BAKBAK_BASE_URL}/voices.
     bakbak_voices: dict[str, Voice] = Field(default_factory=dict)
 
-    # Which LLM answers first (any letter case). The other one, if its key is set, is the automatic fallback.
+    # OpenRouter is the only LLM gateway. The setting remains so an old LLM_PROVIDER=OPENROUTER value still loads;
+    # "groq" is rejected at startup rather than silently honoured.
     llm_provider: Literal["openrouter", "groq"] = "openrouter"
 
     openrouter_api_key: SecretStr | None = None
@@ -73,6 +88,13 @@ class Settings(BaseSettings):
     openrouter_model: str | None = Field(
         None, validation_alias=AliasChoices("openrouter_model", "openrouter_fallback_model")
     )
+    # A different OpenRouter model answering when the primary fails before replying (rate limit, upstream error,
+    # timeout). Empty disables the fallback. Ideally served by a different upstream than the primary, so one
+    # upstream's rate limit cannot take out both.
+    llm_fallback_model: str | None = "openai/gpt-4o-mini"
+    # Longest a caller waits for a reply's first words across the primary, its retries and the fallback; then
+    # the agent speaks its fallback phrase instead of waiting further.
+    llm_response_deadline_ms: int = Field(8000, ge=1000, le=30000)
     openrouter_max_output_tokens: int = 250
     openrouter_temperature: float = 0.4
 
@@ -127,6 +149,14 @@ class Settings(BaseSettings):
     # Silence after speech before Scribe commits a transcript (end of user turn).
     endpointing_min_silence_ms: int = 300
     barge_in_enabled: bool = True
+    # Barge-in needs meaningful caller speech DURING audible agent playback: at least this many letters (any
+    # script, vowel signs included) heard over at least this long. Shorter fragments, pickup "hello"s and noise
+    # are not interruptions.
+    barge_in_min_chars: int = Field(4, ge=1)
+    barge_in_min_speech_ms: int = Field(400, ge=0)
+    # The first this-many ms of the greeting's audio cannot be interrupted; caller speech in that window is
+    # answered after the greeting instead (outbound callees routinely say "hello" on pickup).
+    greeting_protect_ms: int = Field(2500, ge=0)
     # Max audio queued ahead of playback at Exotel; bounds what an interruption must discard.
     audio_queue_max_ms: int = 2000
     asr_timeout_ms: int = 5000
@@ -154,14 +184,21 @@ class Settings(BaseSettings):
     def _llm_provider_any_case(cls, value: object) -> object:
         return value.strip().lower() if isinstance(value, str) else value
 
+    @field_validator("elevenlabs_tts_model_id", "elevenlabs_premium_model_id", mode="after")
+    @classmethod
+    def _no_eleven_v3(cls, value: str) -> str:
+        return normalize_tts_model(value) or value
+
     @model_validator(mode="after")
     def _check_llm_provider(self) -> Self:
-        if self.llm_provider == "groq" and self.groq_api_key is None:
-            raise ValueError("LLM_PROVIDER=groq requires GROQ_API_KEY")
-        if self.llm_provider == "openrouter" and self.openrouter_api_key is None:
-            raise ValueError("LLM_PROVIDER=openrouter requires OPENROUTER_API_KEY")
-        if self.openrouter_api_key is not None and not self.openrouter_model:
-            raise ValueError("OPENROUTER_API_KEY is set, so OPENROUTER_MODEL is required too")
+        if self.llm_provider != "openrouter":
+            raise ValueError("OpenRouter is the only supported LLM gateway: set LLM_PROVIDER=openrouter (or unset it)")
+        if self.openrouter_api_key is None:
+            raise ValueError("OPENROUTER_API_KEY is required")
+        if not self.openrouter_model:
+            raise ValueError("OPENROUTER_MODEL is required")
+        if self.llm_fallback_model is not None and not self.llm_fallback_model.strip():
+            self.llm_fallback_model = None
         return self
 
     @property
@@ -191,7 +228,7 @@ class Settings(BaseSettings):
     inbound_reserved_calls: int = Field(0, ge=0)
     # Answer calls to numbers with no published route with the engine-wide default agent (an agent with
     # is_inbound_default and no client_id). Turn off once every number is routed from the dashboard.
-    inbound_legacy_default_enabled: bool = True
+    inbound_legacy_default_enabled: bool = False
     # When the stream's `to` matches no route, read Exotel's own record of the call (read-only, the account's
     # credentials) and try the ExoPhone that was dialled. Exotel's stream `to` is not always that number.
     exotel_resolve_called_number: bool = True

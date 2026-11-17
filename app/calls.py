@@ -15,12 +15,11 @@ import httpx
 
 from app import db, dispatch_db, inbound_db, metrics, prompts
 from app.allocator import ChannelAllocator, new_allocation_id
-from app.config import ASRProvider, Settings, TTSProvider
+from app.config import ASRProvider, Settings, TTSProvider, normalize_tts_model
 from app.interfaces import ASR, LLM, TTS, LLMUsage, Transcriber, Voice
 from app.models import BAKBAK_MODELS, TTS_MODEL_LANGUAGES, Agent, AgentIn, OutcomeRuleIn
 from app.phone import normalize_phone
 from app.providers.budget import BudgetedLLM
-from app.providers.failover import FailoverLLM
 from app.providers.exotel import ExotelClient, ExotelError, ExotelMediaStream, StreamStart
 from app.redaction import mask_number
 from app.session import SessionConfig, VoiceSession
@@ -31,7 +30,8 @@ log = logging.getLogger(__name__)
 # (that finer-grained check stays in TTS_MODEL_LANGUAGES). Verified: ElevenLabs model pages for the
 # premium/standard tiers; Deepgram Aura live (2026-10-31) and its own model list, which has no hi/ta/te voices.
 TTS_PROVIDER_LANGUAGES: dict[TTSProvider, set[str] | None] = {
-    "elevenlabs_premium": {"en", "hi", "ta", "te"},
+    # Telugu was only ever spoken by eleven_v3, which is no longer allowed.
+    "elevenlabs_premium": {"en", "hi", "ta"},
     "elevenlabs_standard": {"en", "hi", "ta"},
     "deepgram_aura": {"en"},
     "bakbak": None,  # dynamic: whichever languages BAKBAK_VOICES configures
@@ -76,39 +76,40 @@ class Services:
 
 
 def effective_llm_provider(agent: AgentIn, settings: Settings) -> str:
-    """The LLM provider that answers first for this agent: its own choice if this deployment has a key for it,
-    else the engine's LLM_PROVIDER. A workspace's choice can never silently break a call."""
-    if agent.llm_provider and settings.llm_credentials_present(agent.llm_provider):
-        return agent.llm_provider
-    if agent.llm_provider:
-        log.warning("agent's llm_provider override %r has no API key configured; using %r", agent.llm_provider,
-                    settings.llm_provider)
-    return settings.llm_provider
+    """Always "openrouter": the only LLM gateway. A stored "groq" choice (from before this) is ignored, loudly."""
+    if agent.llm_provider and agent.llm_provider != "openrouter":
+        log.warning("agent's llm_provider %r is not supported (OpenRouter only); using openrouter", agent.llm_provider)
+    return "openrouter"
 
 
 def llm_model_for_agent(agent: AgentIn, settings: Settings) -> str:
-    """The model for the first-answering LLM: the agent's own, else that provider's default (never another
-    provider's model, which is what the old settings.primary_llm_model would give for an overridden provider)."""
-    provider = effective_llm_provider(agent, settings)
-    if agent.llm_model and (agent.llm_provider is None or provider == agent.llm_provider):
+    """The primary model: the agent's (workspace's) own, else OPENROUTER_MODEL. A model chosen for a provider
+    other than OpenRouter belongs to that provider's catalogue, so it is not sent to OpenRouter."""
+    if agent.llm_model and agent.llm_provider in (None, "openrouter"):
         return agent.llm_model
-    return settings.llm_model_for(provider)
+    return settings.openrouter_model or ""
+
+
+def llm_fallback_model_for_agent(agent: AgentIn, settings: Settings) -> str | None:
+    """The fallback model: the agent's (workspace's) own, else LLM_FALLBACK_MODEL; None when it would just be
+    the primary model again (no fallback)."""
+    fallback = agent.llm_fallback_model or settings.llm_fallback_model
+    if not fallback or fallback == llm_model_for_agent(agent, settings):
+        return None
+    return fallback
 
 
 def resolve_llm(svc: "Services", agent: AgentIn) -> "LLM":
-    """The LLM for this call. No override on the agent: the engine-wide primary/fallback, exactly as before."""
-    if agent.llm_provider is None and agent.llm_fallback_provider is None:
+    """This call's LLM: its primary model, then its fallback model, on the shared OpenRouter client."""
+    from app.main import failover_for
+
+    client = svc.llm_by_provider.get("openrouter")
+    if client is None:
         return svc.llm
-    settings = svc.settings
-    primary_name = effective_llm_provider(agent, settings)
-    primary = svc.llm_by_provider.get(primary_name)
-    if primary is None:
-        return svc.llm
-    fallback_name = agent.llm_fallback_provider or ("openrouter" if primary_name == "groq" else "groq")
-    fallback = svc.llm_by_provider.get(fallback_name) if fallback_name != primary_name else None
+    fallback = llm_fallback_model_for_agent(agent, svc.settings)
     if fallback is None:
-        log.warning("llm_fallback_provider %r unavailable; no LLM fallback for this call", fallback_name)
-    return FailoverLLM(primary=primary, fallback=fallback, fallback_model=settings.llm_model_for(fallback_name))
+        log.warning("no LLM fallback model for this call (primary %s)", llm_model_for_agent(agent, svc.settings))
+    return failover_for(client, svc.settings, fallback)
 
 
 def _elevenlabs_model_id(provider: TTSProvider, settings: Settings) -> str:
@@ -131,6 +132,14 @@ def _default_tts_voice(provider: TTSProvider, settings: Settings, language: str)
     return Voice(voice_id=settings.elevenlabs_tts_voice_id, model_id=_elevenlabs_model_id(provider, settings))
 
 
+def allowed_tts_model(model_id: str | None) -> str | None:
+    """`model_id`, unless it is a disallowed model (eleven_v3), which is replaced by the default and logged."""
+    allowed = normalize_tts_model(model_id)
+    if allowed != model_id:
+        log.warning("TTS model %r is not allowed; using %r instead", model_id, allowed)
+    return allowed
+
+
 def voice_for(agent: AgentIn, settings: Settings) -> Voice:
     """The primary provider's voice for this agent: its own voice_id/tts_model_id override the default, if set."""
     provider = agent.tts_provider or settings.tts_provider
@@ -138,7 +147,7 @@ def voice_for(agent: AgentIn, settings: Settings) -> Voice:
     assert default is not None, "validate_agent must reject an agent whose language the primary cannot speak"
     return Voice(
         voice_id=agent.voice_id or default.voice_id,
-        model_id=agent.tts_model_id or default.model_id,
+        model_id=allowed_tts_model(agent.tts_model_id) or default.model_id,
         settings=agent.voice_settings,
     )
 
@@ -174,7 +183,7 @@ def validate_agent(agent: AgentIn, settings: Settings) -> str | None:
     if languages is None:
         return f"Unsupported TTS model {model!r}; use one of {sorted(TTS_MODEL_LANGUAGES)}"
     if agent.language not in languages:
-        return f"TTS model {model!r} cannot speak language {agent.language!r}; use eleven_v3"
+        return f"TTS model {model!r} cannot speak language {agent.language!r}"
     return None
 
 
@@ -282,6 +291,9 @@ def session_config(agent: Agent, settings: Settings, caller_context: str) -> Ses
         log_transcripts=settings.log_transcripts,
         llm_dedup_window_ms=settings.llm_dedup_window_ms,
         max_consecutive_llm_failures=settings.max_consecutive_llm_failures,
+        barge_in_min_chars=settings.barge_in_min_chars,
+        barge_in_min_speech_ms=settings.barge_in_min_speech_ms,
+        greeting_protect_ms=settings.greeting_protect_ms,
     )
 
 
@@ -297,7 +309,7 @@ def with_call_voice(
     if not voice_id:
         return agent
     update = {"voice_id": voice_id}
-    if tts_model_id:
+    if tts_model_id := allowed_tts_model(tts_model_id):
         update["tts_model_id"] = tts_model_id
     if voice_settings:
         update["voice_settings"] = voice_settings
@@ -598,6 +610,8 @@ async def run_call(
                 fallback_tts=fallback_tts,
                 call_id=call_id,
                 call_sid=start.call_sid,
+                tts_provider=tts_provider_name,
+                fallback_tts_provider=fallback_tts_provider_name or "",
             )
             end_reason = await session.run()
     except asyncio.CancelledError:
@@ -606,8 +620,11 @@ async def run_call(
         log.exception("call %s failed", call_id)
         end_reason = f"error:{type(exc).__name__}"
     finally:
-        # Closing media does not confirm provider termination.
+        # Closing the socket ends the Voicebot applet; it does not by itself prove Exotel ended the call (a flow
+        # step after the applet could keep the line open). For calls the engine ended, check Exotel's record.
         await media.close()
+    if not cancelled and not end_reason.startswith("caller:"):
+        _spawn(verify_exotel_termination(svc, start.call_sid, call_id, end_reason))
 
     # Persist in a separate task so a cancelled handler cannot abort the write half-way.
     connected_seconds = time.monotonic() - started
@@ -631,6 +648,49 @@ async def run_call(
     )
     if cancelled:
         raise asyncio.CancelledError
+
+
+# Background tasks this module starts and must keep a reference to until they finish.
+_background: set[asyncio.Task] = set()
+# How long Exotel gets to move a call the engine hung up on into a terminal state before it is checked.
+TERMINATION_CHECK_DELAY_SECONDS = 8.0
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "busy", "no-answer", "canceled", "cancelled"})
+
+
+def _spawn(coro) -> None:
+    task = asyncio.ensure_future(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def verify_exotel_termination(
+    svc: Services, call_sid: str, call_id: int | None, end_reason: str, *, delay: float | None = None
+) -> str:
+    """After the engine ended a call (closed the media stream), confirm from Exotel's own record that the call
+    actually ended rather than staying open on a later flow step. Read-only; returns and logs the verdict:
+    "terminated", "still_live" or "unverified"."""
+    await asyncio.sleep(TERMINATION_CHECK_DELAY_SECONDS if delay is None else delay)
+    try:
+        record = await svc.exotel.get_call_record(call_sid, wait_seconds=svc.settings.exotel_lookup_timeout_seconds)
+    except Exception as exc:
+        log.warning(
+            "exotel termination unverified call_id=%s call_sid=%s end_reason=%s: %s",
+            call_id, call_sid, end_reason, type(exc).__name__,
+        )
+        return "unverified"
+    status = (record.status or "").lower()
+    if status in _TERMINAL_STATUSES:
+        log.info(
+            "exotel termination confirmed call_id=%s call_sid=%s end_reason=%s exotel_status=%s",
+            call_id, call_sid, end_reason, status,
+        )
+        return "terminated"
+    log.error(
+        "exotel call still live after the engine ended it call_id=%s call_sid=%s end_reason=%s exotel_status=%s: "
+        "check that the Exotel flow ends (Hangup) after the Voicebot applet",
+        call_id, call_sid, end_reason, status or "unknown",
+    )
+    return "still_live"
 
 
 async def _finalize(
@@ -659,6 +719,8 @@ async def _finalize(
         "tts_characters": session.tts_characters if session else 0,
         "fallback_tts_characters": session.fallback_tts_characters if session else 0,
         "llm_model": config.llm_model,
+        "llm_models_served": sorted({t["llm_model"] for t in turns if t.get("llm_model")}),
+        "response_failures": session.failures if session else [],
         "llm_prompt_tokens": llm_usage.prompt_tokens,
         "llm_completion_tokens": llm_usage.completion_tokens,
         "llm_cost_usd": round(llm_usage.cost_usd, 6),
