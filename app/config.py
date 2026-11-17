@@ -8,6 +8,7 @@ from app.interfaces import Voice
 
 TTSProvider = Literal["bakbak", "elevenlabs_premium", "elevenlabs_standard", "deepgram_aura"]
 ASRProvider = Literal["elevenlabs_scribe", "deepgram_nova3"]
+LLMProvider = Literal["openrouter", "groq"]
 
 
 class Settings(BaseSettings):
@@ -166,7 +167,14 @@ class Settings(BaseSettings):
     @property
     def primary_llm_model(self) -> str:
         """Model used when an agent doesn't set llm_model: the primary provider's."""
-        return self.groq_model if self.llm_provider == "groq" else self.openrouter_model
+        return self.llm_model_for(self.llm_provider)
+
+    def llm_model_for(self, provider: LLMProvider) -> str:
+        """The default model of one LLM provider, whatever its role."""
+        return self.groq_model if provider == "groq" else (self.openrouter_model or "")
+
+    def llm_credentials_present(self, provider: LLMProvider) -> bool:
+        return (self.groq_api_key if provider == "groq" else self.openrouter_api_key) is not None
 
     # Campaign dispatch from the Mona dashboard. The same value must be the dashboard's
     # VOICE_ENGINE_WEBHOOK_SECRET; without it dispatches are rejected because results could not be reported.

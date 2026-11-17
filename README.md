@@ -62,6 +62,14 @@ The other provider is the automatic fallback when its key is set; without it the
 are raised as they are. The primary's key must be set or the engine refuses to start. Both are called through the same
 OpenAI-compatible streaming adapter (`app/providers/chat_completions.py`); `app/providers/failover.py` chooses.
 
+**Per-workspace override.** `LLM_PROVIDER` and `OPENROUTER_MODEL` are only the engine-wide default. A Super Admin can
+set a workspace's LLM provider, fallback and model in the dashboard; they arrive on the persona (`llmProvider`,
+`llmFallbackProvider`, `llmModel`) and win for that workspace's calls. A provider without an API key here is ignored
+(a warning is logged and the default is used). `GET /llm/options` lists the providers with keys and their live models.
+
+**Voice.** A campaign's chosen voice and TTS model beat the `ELEVENLABS_*_MODEL_ID` variables, which are only the default
+when none is chosen. `GET /voices?provider=<tts provider>` lists another provider's voices than the engine default.
+
 - **OpenRouter:** `POST {OPENROUTER_BASE_URL}/chat/completions` (default `https://openrouter.ai/api/v1`) with
   `Authorization: Bearer $OPENROUTER_API_KEY`, model `OPENROUTER_MODEL`. `OPENROUTER_FALLBACK_MODEL`, the name this
   setting had when OpenRouter was always the fallback, is still read.

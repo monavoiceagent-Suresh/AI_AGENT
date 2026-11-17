@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from app.calls import Services, _default_tts_voice
-from app.config import Settings
+from app.config import Settings, TTSProvider
 from app.models import VoiceOption, VoicesOut
 
 BAKBAK_TIMEOUT_SECONDS = 10
@@ -139,14 +139,18 @@ def _parse_elevenlabs(payload: Any) -> list[VoiceOption]:
     return options
 
 
-async def list_voices(http: httpx.AsyncClient, settings: Settings) -> VoicesOut:
-    if settings.tts_provider == "deepgram_aura":
+async def list_voices(http: httpx.AsyncClient, settings: Settings, provider: TTSProvider | None = None) -> VoicesOut:
+    """The voices of `provider` (a workspace/persona choice), else of the engine's global TTS_PROVIDER."""
+    provider = provider or settings.tts_provider
+    if not settings.tts_credentials_present(provider):
+        raise VoicesUnavailable(f"TTS provider {provider!r} has no credentials configured on the voice engine")
+    if provider == "deepgram_aura":
         options = [
             VoiceOption(voice_id=f"aura-2-{name}-en", name=name.capitalize(), language="en", model_id="aura-2")
             for name in DEEPGRAM_AURA_EN_VOICES
         ]
         return VoicesOut(provider="deepgram", voices=options)
-    if settings.tts_provider == "bakbak":
+    if provider == "bakbak":
         vendor, url = "bakbak", f"{settings.bakbak_base_url.rstrip('/')}/voices"
         headers = {"X-API-Key": settings.bakbak_api_key.get_secret_value()}
         timeout = BAKBAK_TIMEOUT_SECONDS

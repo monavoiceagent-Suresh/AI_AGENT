@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
-from app.config import ASRProvider, TTSProvider
+from app.config import ASRProvider, LLMProvider, TTSProvider
 from app.phone import indian_number_problem
 
 Language = Literal["en", "hi", "ta", "te"]
@@ -68,6 +68,10 @@ class AgentIn(BaseModel):
             "Overrides the primary model (OPENROUTER_MODEL) for this agent. The fallback always uses GROQ_MODEL."
         ),
     )
+    llm_provider: LLMProvider | None = Field(None, description="Overrides LLM_PROVIDER for this agent.")
+    llm_fallback_provider: LLMProvider | None = Field(
+        None, description="Overrides which LLM provider is the automatic fallback for this agent."
+    )
     asr_provider: ASRProvider | None = Field(None, description="Overrides ASR_PROVIDER for this agent.")
     asr_fallback_provider: ASRProvider | None = Field(
         None, description="Overrides ASR_FALLBACK_PROVIDER for this agent."
@@ -112,6 +116,8 @@ class AgentIn(BaseModel):
     def _check_provider_overrides(self) -> Self:
         if self.asr_provider is not None and self.asr_provider == self.asr_fallback_provider:
             raise ValueError("asr_fallback_provider must differ from asr_provider")
+        if self.llm_provider is not None and self.llm_provider == self.llm_fallback_provider:
+            raise ValueError("llm_fallback_provider must differ from llm_provider")
         if self.tts_provider is not None and self.tts_provider == self.tts_fallback_provider:
             raise ValueError("tts_fallback_provider must differ from tts_provider")
         return self
@@ -206,6 +212,9 @@ class PersonaIn(_Camel):
     asr_fallback_provider: ASRProvider | None = None
     tts_provider: TTSProvider | None = None
     tts_fallback_provider: TTSProvider | None = None
+    llm_provider: LLMProvider | None = None
+    llm_fallback_provider: LLMProvider | None = None
+    llm_model: str | None = Field(None, max_length=200)
 
     @model_validator(mode="after")
     def _check_outcome_rules(self) -> Self:
@@ -222,6 +231,8 @@ class PersonaIn(_Camel):
     def _check_provider_overrides(self) -> Self:
         if self.asr_provider is not None and self.asr_provider == self.asr_fallback_provider:
             raise ValueError("asrFallbackProvider must differ from asrProvider")
+        if self.llm_provider is not None and self.llm_provider == self.llm_fallback_provider:
+            raise ValueError("llmFallbackProvider must differ from llmProvider")
         if self.tts_provider is not None and self.tts_provider == self.tts_fallback_provider:
             raise ValueError("ttsFallbackProvider must differ from ttsProvider")
         return self

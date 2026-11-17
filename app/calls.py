@@ -6,7 +6,7 @@ import sys
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
@@ -20,6 +20,7 @@ from app.interfaces import ASR, LLM, TTS, LLMUsage, Transcriber, Voice
 from app.models import BAKBAK_MODELS, TTS_MODEL_LANGUAGES, Agent, AgentIn, OutcomeRuleIn
 from app.phone import normalize_phone
 from app.providers.budget import BudgetedLLM
+from app.providers.failover import FailoverLLM
 from app.providers.exotel import ExotelClient, ExotelError, ExotelMediaStream, StreamStart
 from app.redaction import mask_number
 from app.session import SessionConfig, VoiceSession
@@ -68,6 +69,46 @@ class Services:
     # M2: the account-wide concurrent-channel budget (app/allocator.py). Replaces the old
     # per-process active_calls/ringing counters entirely — there is no in-memory fallback.
     allocator: ChannelAllocator
+    # One shared client per LLM provider this deployment has a key for (None where it doesn't), so a workspace's or
+    # persona's LLM choice is honoured without building anything at call time. Shared, so each provider's
+    # rate limiter stays a real process-wide budget.
+    llm_by_provider: dict[str, "LLM | None"] = field(default_factory=dict)
+
+
+def effective_llm_provider(agent: AgentIn, settings: Settings) -> str:
+    """The LLM provider that answers first for this agent: its own choice if this deployment has a key for it,
+    else the engine's LLM_PROVIDER. A workspace's choice can never silently break a call."""
+    if agent.llm_provider and settings.llm_credentials_present(agent.llm_provider):
+        return agent.llm_provider
+    if agent.llm_provider:
+        log.warning("agent's llm_provider override %r has no API key configured; using %r", agent.llm_provider,
+                    settings.llm_provider)
+    return settings.llm_provider
+
+
+def llm_model_for_agent(agent: AgentIn, settings: Settings) -> str:
+    """The model for the first-answering LLM: the agent's own, else that provider's default (never another
+    provider's model, which is what the old settings.primary_llm_model would give for an overridden provider)."""
+    provider = effective_llm_provider(agent, settings)
+    if agent.llm_model and (agent.llm_provider is None or provider == agent.llm_provider):
+        return agent.llm_model
+    return settings.llm_model_for(provider)
+
+
+def resolve_llm(svc: "Services", agent: AgentIn) -> "LLM":
+    """The LLM for this call. No override on the agent: the engine-wide primary/fallback, exactly as before."""
+    if agent.llm_provider is None and agent.llm_fallback_provider is None:
+        return svc.llm
+    settings = svc.settings
+    primary_name = effective_llm_provider(agent, settings)
+    primary = svc.llm_by_provider.get(primary_name)
+    if primary is None:
+        return svc.llm
+    fallback_name = agent.llm_fallback_provider or ("openrouter" if primary_name == "groq" else "groq")
+    fallback = svc.llm_by_provider.get(fallback_name) if fallback_name != primary_name else None
+    if fallback is None:
+        log.warning("llm_fallback_provider %r unavailable; no LLM fallback for this call", fallback_name)
+    return FailoverLLM(primary=primary, fallback=fallback, fallback_model=settings.llm_model_for(fallback_name))
 
 
 def _elevenlabs_model_id(provider: TTSProvider, settings: Settings) -> str:
@@ -234,7 +275,7 @@ def session_config(agent: Agent, settings: Settings, caller_context: str) -> Ses
         language=agent.language,
         voice=voice_for(agent, settings),
         fallback_voice=fallback_voice_for(agent, settings),
-        llm_model=agent.llm_model or settings.primary_llm_model,
+        llm_model=llm_model_for_agent(agent, settings),
         barge_in=settings.barge_in_enabled,
         idle_timeout_seconds=settings.session_idle_timeout_seconds,
         max_duration_seconds=settings.max_call_duration_seconds,
@@ -247,10 +288,17 @@ def session_config(agent: Agent, settings: Settings, caller_context: str) -> Ses
 def with_call_voice(
     agent: Agent, voice_id: str | None, tts_model_id: str | None, voice_settings: dict | None = None
 ) -> Agent:
-    """The voice this call was placed with, on its own copy of the agent; the agent's voice when none was chosen."""
-    if not (voice_id and tts_model_id):
+    """The voice this call was placed with, on its own copy of the agent; the agent's voice when none was chosen.
+
+    tts_model_id is optional even when voice_id is set: ElevenLabs voices (unlike Bakbak's) carry no
+    model id of their own, so a campaign's ElevenLabs voice choice only ever supplies voice_id, and must
+    still override the agent's voice — leaving tts_model_id to the agent's own default/override.
+    """
+    if not voice_id:
         return agent
-    update = {"voice_id": voice_id, "tts_model_id": tts_model_id}
+    update = {"voice_id": voice_id}
+    if tts_model_id:
+        update["tts_model_id"] = tts_model_id
     if voice_settings:
         update["voice_settings"] = voice_settings
     return agent.model_copy(update=update)
@@ -536,7 +584,7 @@ async def run_call(
     # time limit), so total occupancy does not change here — only how this allocation is counted.
     await svc.allocator.mark_connected_by_call_sid(start.call_sid)
     # Fresh per call: it only caps this one call's own requests, on top of each provider's own shared throttle.
-    call_llm = BudgetedLLM(svc.llm, max_requests=settings.llm_max_requests_per_call, call_sid=start.call_sid)
+    call_llm = BudgetedLLM(resolve_llm(svc, agent), max_requests=settings.llm_max_requests_per_call, call_sid=start.call_sid)
     try:
         async with connect_asr(
             asr, fallback_asr, language=agent.language, sample_rate=media.sample_rate

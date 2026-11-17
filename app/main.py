@@ -180,6 +180,10 @@ async def lifespan(app: FastAPI):
         fallback_asr=fallback_asr,
         asr_by_provider=asr_by_provider,
         llm=llm,
+        llm_by_provider={
+            name: (_llm_client(http, settings, name, primary=True) if settings.llm_credentials_present(name) else None)
+            for name in ("openrouter", "groq")
+        },
         tts=primary_tts,
         fallback_tts=fallback_tts,
         tts_by_provider=tts_by_provider,

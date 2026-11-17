@@ -18,6 +18,7 @@ AGENT_COLUMNS = (
     "outcome_rules, outcome_fallback, "
     "voice_id, tts_model_id, llm_model, "
     "asr_provider, asr_fallback_provider, tts_provider, tts_fallback_provider, "
+    "llm_provider, llm_fallback_provider, "
     "is_inbound_default, client_id, persona_key"
 )
 _AGENT_PLACEHOLDERS = ", ".join(f"${n}" for n in range(1, len(AGENT_COLUMNS.split(",")) + 1))
@@ -75,6 +76,8 @@ def _agent_args(agent: AgentIn) -> tuple[Any, ...]:
         agent.asr_fallback_provider,
         agent.tts_provider,
         agent.tts_fallback_provider,
+        agent.llm_provider,
+        agent.llm_fallback_provider,
         agent.is_inbound_default,
         agent.client_id,
         agent.persona_key,

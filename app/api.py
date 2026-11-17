@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from starlette.background import BackgroundTask
 
-from app import calls, db, dispatch, dispatch_db, inbound, inbound_db, monitoring, tenants, voices
+from app import calls, db, dispatch, dispatch_db, inbound, inbound_db, llm_models, monitoring, tenants, voices
 from app.calls import CallRejected, Services
 from app.interfaces import TTSError
 from app.models import (
@@ -97,12 +97,23 @@ async def create_agent(agent: AgentIn, svc: Svc) -> Agent:
 
 
 @admin.get("/voices")
-async def list_voices(svc: Svc) -> VoicesOut:
-    """The real voices the configured TTS provider has right now, for the dashboard's voice picker."""
+async def list_voices(
+    svc: Svc,
+    provider: Annotated[
+        Literal["bakbak", "elevenlabs_premium", "elevenlabs_standard", "deepgram_aura"] | None, Query()
+    ] = None,
+) -> VoicesOut:
+    """The real voices a TTS provider has right now (default: the engine's own), for the dashboard's voice picker."""
     try:
-        return await voices.list_voices(svc.http, svc.settings)
+        return await voices.list_voices(svc.http, svc.settings, provider)
     except voices.VoicesUnavailable as exc:
         raise HTTPException(502, str(exc)) from exc
+
+
+@admin.get("/llm/options")
+async def llm_options(svc: Svc) -> dict:
+    """The LLM providers this engine has keys for, and the models each offers, for the Super Admin's LLM form."""
+    return await llm_models.llm_options(svc.http, svc.settings)
 
 
 @admin.get("/agents")
