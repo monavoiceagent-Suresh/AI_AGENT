@@ -198,15 +198,35 @@ async def test_backoff_never_exceeds_the_configured_cap(monkeypatch):
     assert all(s <= 0.5 + 0.3 for s in sleeps)  # capped delay plus its own jitter, never unbounded growth
 
 
-async def test_a_429_is_never_retried_inline_even_when_retries_are_allowed():
+async def test_a_429_is_not_retried_without_a_retry_budget():
+    # The primary model runs with no retries in production: its 429 goes to the fallback model immediately.
     transport = CountingTransport(rate_limited())
-    llm = client(transport, retries=3)
+    llm = client(transport, retries=0)
 
     with pytest.raises(LLMError) as exc:
         await drain(llm)
 
-    assert exc.value.status == 429
-    assert transport.calls == 1  # no retry burned on a rate limit; the caller should use the fallback instead
+    assert exc.value.status == 429 and transport.calls == 1
+
+
+async def test_a_429_retry_waits_out_retry_after_only_when_the_deadline_allows():
+    import time as _time
+
+    # Retry-After 0.3 s fits a 5 s deadline: one bounded retry, made only after the cooldown has passed.
+    transport = CountingTransport(rate_limited("0.3"), ok())
+    llm = client(transport, retries=3)
+    started = _time.monotonic()
+    async for _ in llm.stream(MESSAGES, "m", deadline=_time.monotonic() + 5):
+        pass
+    assert transport.calls == 2 and _time.monotonic() - started >= 0.29
+
+    # Retry-After 30 s cannot fit: no retry, the error goes straight back (to the fallback model).
+    transport = CountingTransport(rate_limited("30"))
+    llm = client(transport, retries=3)
+    with pytest.raises(LLMError):
+        async for _ in llm.stream(MESSAGES, "m", deadline=_time.monotonic() + 5):
+            pass
+    assert transport.calls == 1
 
 
 # ---- per-call request budget --------------------------------------------------------------------------------

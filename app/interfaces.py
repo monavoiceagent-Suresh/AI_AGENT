@@ -1,6 +1,6 @@
 """Contracts between the voice-session orchestrator and the provider adapters."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Protocol
@@ -63,8 +63,11 @@ class Transcriber(Protocol):
 
 
 class ASR(Protocol):
-    def connect(self, *, language: str, sample_rate: int) -> AbstractAsyncContextManager[Transcriber]:
-        """One streaming session for one call."""
+    def connect(
+        self, *, language: str, sample_rate: int, keyterms: Sequence[str] = ()
+    ) -> AbstractAsyncContextManager[Transcriber]:
+        """One streaming session for one call. `keyterms` (app/recognition.py) bias recognition towards a
+        persona's own vocabulary; empty means the provider's plain behaviour."""
 
 
 @dataclass(frozen=True)
@@ -81,9 +84,19 @@ class LLMUsage:
         )
 
 
+@dataclass(frozen=True)
+class LLMServed:
+    """Which provider/model actually produced a reply, yielded once before its first text. `role` is
+    "primary" or "fallback" when the failover layer chose it, "-" otherwise."""
+
+    provider: str
+    model: str
+    role: str = "-"
+
+
 class LLM(Protocol):
-    def stream(self, messages: list[dict[str, str]], model: str) -> AsyncIterator[str | LLMUsage]:
-        """Yield text deltas, then a final LLMUsage."""
+    def stream(self, messages: list[dict[str, str]], model: str) -> AsyncIterator[str | LLMUsage | LLMServed]:
+        """Yield text deltas (optionally preceded by one LLMServed), then a final LLMUsage."""
 
     async def complete(self, messages: list[dict[str, str]], model: str) -> tuple[str, LLMUsage]: ...
 

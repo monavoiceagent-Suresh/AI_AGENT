@@ -13,6 +13,25 @@ def tts_inr_per_1k_chars(settings: Settings, provider: str, model_id: str) -> fl
     return usd * settings.usd_to_inr if usd is not None else None
 
 
+def asr_segment_usd(settings: Settings, segment: dict[str, Any]) -> tuple[float, float] | None:
+    """(base, keyterm surcharge) in USD for one ASR provider session (app/asr_recovery.Segment.record), priced
+    at that provider's own rates; None for a provider with no configured rate."""
+    seconds = float(segment.get("seconds") or 0.0)
+    with_keyterms = bool(segment.get("keyterms_sent"))
+    provider = segment.get("provider")
+    if provider == "elevenlabs_scribe":
+        hours = seconds / 3600
+        return hours * settings.elevenlabs_asr_usd_per_hour, (
+            hours * settings.elevenlabs_asr_keyterms_usd_per_hour if with_keyterms else 0.0
+        )
+    if provider == "deepgram_nova3":
+        minutes = seconds / 60
+        return minutes * settings.deepgram_asr_usd_per_minute, (
+            minutes * settings.deepgram_asr_keyterms_usd_per_minute if with_keyterms else 0.0
+        )
+    return None
+
+
 def call_cost(
     settings: Settings,
     *,
@@ -20,20 +39,37 @@ def call_cost(
     asr_seconds: float,
     tts_usage: list[tuple[int, float | None]],
     llm_cost_usd: float,
+    asr_segments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """`tts_usage` lists (characters, INR per 1k characters) for each TTS provider used on the call."""
+    """`tts_usage` lists (characters, INR per 1k characters) for each TTS provider used on the call.
+
+    `asr_segments` (one per ASR provider session, replays included) prices ASR per provider, with the keyterm
+    surcharge only for sessions that sent keyterms. Without it (callers predating per-provider tracking), ASR is
+    `asr_seconds` at the ElevenLabs rate, as it always was."""
     fx = settings.usd_to_inr
-    asr = asr_seconds / 3600 * settings.elevenlabs_asr_usd_per_hour * fx
+    asr: float | None
+    asr_keyterms = 0.0
+    if asr_segments is None:
+        asr = asr_seconds / 3600 * settings.elevenlabs_asr_usd_per_hour * fx
+    else:
+        priced = [asr_segment_usd(settings, s) for s in asr_segments]
+        if any(p is None for p, s in zip(priced, asr_segments, strict=True) if s.get("seconds")):
+            asr = None  # a provider without a rate: unknown, never guessed
+        else:
+            asr = sum((base + extra) * fx for base, extra in (p for p in priced if p is not None))
+            asr_keyterms = sum(extra * fx for _, extra in (p for p in priced if p is not None))
     unpriced = any(chars and rate is None for chars, rate in tts_usage)
     tts = None if unpriced else sum(chars / 1000 * rate for chars, rate in tts_usage if chars)
     llm = llm_cost_usd * fx
     minutes = connected_seconds / 60
     telephony = minutes * settings.exotel_inr_per_minute if settings.exotel_inr_per_minute is not None else None
-    total = asr + llm + (tts or 0.0) + (telephony or 0.0)
+    total = (asr or 0.0) + llm + (tts or 0.0) + (telephony or 0.0)
     per_minute = total / minutes if minutes > 0 else None
     return {
         "currency": "INR",
-        "asr": round(asr, 4),
+        "asr": round(asr, 4) if asr is not None else None,
+        # The part of "asr" that is the keyterm surcharge (already included in "asr" and "total").
+        "asr_keyterms": round(asr_keyterms, 4),
         "tts": round(tts, 4) if tts is not None else None,
         "llm": round(llm, 4),
         "telephony": round(telephony, 4) if telephony is not None else None,
@@ -42,7 +78,7 @@ def call_cost(
         "target_per_connected_minute": settings.target_cost_per_connected_minute_inr,
         "within_target": per_minute <= settings.target_cost_per_connected_minute_inr if per_minute else None,
         # Components priced as None are unknown and excluded from the total.
-        "complete": tts is not None and telephony is not None,
+        "complete": asr is not None and tts is not None and telephony is not None,
     }
 
 

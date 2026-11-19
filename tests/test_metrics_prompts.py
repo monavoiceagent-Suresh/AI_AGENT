@@ -182,3 +182,55 @@ def test_without_custom_rules_the_fixed_per_workflow_list_is_used_exactly_as_bef
     content = prompts.outcome_messages(a, [("Caller", "hi")])[1]["content"]
     assert "Call goal:" in content
     assert prompts.parse_outcome(a, '{"outcome": "qualified", "summary": "x"}')[0] == "qualified"
+
+
+# ---- ASR cost per provider (app/asr_recovery.Segment records) ----------------------------------------------
+
+
+def segment(provider: str, seconds: float, keyterms_sent: int = 0) -> dict:
+    return {"provider": provider, "role": "primary", "seconds": seconds, "replayed_seconds": 0.0,
+            "keyterms_sent": keyterms_sent, "keyterms_accepted": None, "end": "closed"}
+
+
+def asr_cost(*segments: dict) -> dict:
+    return call_cost(settings(exotel_inr_per_minute=0), connected_seconds=60, asr_seconds=0, tts_usage=[],
+                     llm_cost_usd=0, asr_segments=list(segments))
+
+
+def test_scribe_is_priced_at_its_rate_and_its_keyterm_surcharge_only_when_keyterms_were_sent():
+    plain, hinted = asr_cost(segment("elevenlabs_scribe", 3600)), asr_cost(segment("elevenlabs_scribe", 3600, 3))
+    assert plain["asr"] == 33.15 and plain["asr_keyterms"] == 0  # 0.39 USD/h * 85
+    assert hinted["asr"] == 39.95 and hinted["asr_keyterms"] == 6.8  # + 0.08 USD/h * 85
+
+
+def test_deepgram_is_never_priced_at_elevenlabs_rates():
+    plain, hinted = asr_cost(segment("deepgram_nova3", 60)), asr_cost(segment("deepgram_nova3", 60, 3))
+    assert plain["asr"] == 0.408  # 0.0048 USD/min * 85
+    assert hinted["asr"] == 0.5185 and hinted["asr_keyterms"] == 0.1105  # + 0.0013 USD/min * 85
+    assert asr_cost(segment("deepgram_nova3", 3600))["asr"] != asr_cost(segment("elevenlabs_scribe", 3600))["asr"]
+
+
+def test_a_call_that_failed_over_is_priced_per_provider_including_replayed_audio():
+    cost = asr_cost(segment("elevenlabs_scribe", 1800, 2), segment("deepgram_nova3", 600, 2))
+    assert cost["asr"] == round(0.5 * 0.47 * 85 + 10 * 0.0061 * 85, 4)
+
+
+def test_asr_rates_are_configurable():
+    cfg = settings(exotel_inr_per_minute=0, deepgram_asr_usd_per_minute=0.0077, deepgram_asr_keyterms_usd_per_minute=0)
+    cost = call_cost(cfg, connected_seconds=60, asr_seconds=0, tts_usage=[], llm_cost_usd=0,
+                     asr_segments=[segment("deepgram_nova3", 60, 5)])
+    assert cost["asr"] == round(0.0077 * 85, 4) and cost["asr_keyterms"] == 0
+
+
+def test_an_unpriced_asr_provider_is_unknown_not_zero():
+    cost = asr_cost(segment("some_new_provider", 60))
+    assert cost["asr"] is None and cost["complete"] is False and cost["total"] == 0
+    assert asr_cost(segment("some_new_provider", 0))["asr"] == 0  # a connect that never carried audio costs nothing
+
+
+def test_callers_without_asr_segments_are_priced_exactly_as_before():
+    """Historical compatibility: the pre-per-provider formula is unchanged (asr_seconds at the ElevenLabs rate),
+    and stored call costs are never recomputed (nothing re-prices a finished call)."""
+    cfg = settings(exotel_inr_per_minute=0.6)
+    before = call_cost(cfg, connected_seconds=60, asr_seconds=60, tts_usage=[], llm_cost_usd=0)
+    assert before["asr"] == 0.5525 and before["asr_keyterms"] == 0 and before["complete"] is True

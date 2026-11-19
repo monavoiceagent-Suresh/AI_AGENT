@@ -1,8 +1,9 @@
-"""Per-agent LLM provider/model overrides (the Super Admin's workspace choice, resolved by the dashboard)."""
+"""Per-workspace LLM model choice (the Super Admin's setting, resolved by the dashboard): OpenRouter only, a primary
+model and a fallback model, each falling back to the engine's own default when not set."""
 
 import pytest
 
-from app.calls import effective_llm_provider, llm_model_for_agent, resolve_llm
+from app.calls import effective_llm_provider, llm_fallback_model_for_agent, llm_model_for_agent, resolve_llm
 from app.models import AgentIn, PersonaIn
 from app.providers.failover import FailoverLLM
 from tests.fakes import make_settings
@@ -19,41 +20,51 @@ class Services:
 
 
 def cfg(**kw):
-    return make_settings(openrouter_model="or-model", groq_api_key="g", groq_model="groq-model", **kw)
+    return make_settings(openrouter_model="or-model", llm_fallback_model="or-fallback", **kw)
 
 
-def test_no_override_uses_the_engine_wide_llm_and_the_primary_model():
-    svc = Services(cfg(), {})
+def test_no_override_uses_the_engine_defaults():
+    settings = cfg()
     agent = agent_in()
-    assert resolve_llm(svc, agent) is svc.llm
-    assert llm_model_for_agent(agent, svc.settings) == "or-model"
+    assert llm_model_for_agent(agent, settings) == "or-model"
+    assert llm_fallback_model_for_agent(agent, settings) == "or-fallback"
 
 
-def test_override_picks_that_providers_own_model_not_the_env_providers():
-    settings = cfg()  # env primary is OpenRouter
-    assert effective_llm_provider(agent_in(llm_provider="groq"), settings) == "groq"
-    assert llm_model_for_agent(agent_in(llm_provider="groq"), settings) == "groq-model"
-    assert llm_model_for_agent(agent_in(llm_provider="groq", llm_model="custom"), settings) == "custom"
+def test_workspace_models_override_the_defaults():
+    settings = cfg()
+    agent = agent_in(llm_model="google/gemini-2.5-flash-lite", llm_fallback_model="openai/gpt-4o-mini")
+    assert llm_model_for_agent(agent, settings) == "google/gemini-2.5-flash-lite"
+    assert llm_fallback_model_for_agent(agent, settings) == "openai/gpt-4o-mini"
 
 
-def test_override_without_a_key_falls_back_to_the_global_provider_and_its_model():
-    settings = make_settings(openrouter_model="or-model", groq_api_key=None)  # no Groq key
-    agent = agent_in(llm_provider="groq", llm_model="groq-only-model")
+def test_a_stored_groq_choice_is_ignored_and_its_model_is_never_sent_to_openrouter():
+    settings = cfg()
+    agent = agent_in(llm_provider="groq", llm_model="openai/gpt-oss-20b")
     assert effective_llm_provider(agent, settings) == "openrouter"
     assert llm_model_for_agent(agent, settings) == "or-model"
 
 
-def test_resolve_llm_builds_a_failover_from_the_chosen_pair():
-    svc = Services(cfg(), {"openrouter": object(), "groq": object()})
-    llm = resolve_llm(svc, agent_in(llm_provider="groq", llm_fallback_provider="openrouter"))
+def test_a_fallback_equal_to_the_primary_is_no_fallback():
+    agent = agent_in(llm_model="same", llm_fallback_model="same")
+    assert llm_fallback_model_for_agent(agent, cfg()) is None
+
+
+def test_resolve_llm_builds_a_failover_on_the_shared_openrouter_client():
+    client = object()
+    svc = Services(cfg(), {"openrouter": client, "groq": None})
+    llm = resolve_llm(svc, agent_in(llm_fallback_model="ws-fallback"))
     assert isinstance(llm, FailoverLLM)
-    assert llm._primary is svc.llm_by_provider["groq"] and llm._fallback is svc.llm_by_provider["openrouter"]
-    assert llm._fallback_model == "or-model"
+    assert llm._primary is client and llm._fallback is client and llm.fallback_model == "ws-fallback"
 
 
-def test_same_primary_and_fallback_is_rejected():
+def test_persona_snapshot_carries_the_fallback_model():
+    persona = PersonaIn(
+        key="ab", name="A", language="en", instructions="i", greeting="g", version=1,
+        llm_model="p-model", llm_fallback_model="f-model",
+    )
+    assert persona.llm_fallback_model == "f-model"
+
+
+def test_same_primary_and_fallback_provider_is_still_rejected():
     with pytest.raises(ValueError, match="llm_fallback_provider must differ"):
         agent_in(llm_provider="groq", llm_fallback_provider="groq")
-    with pytest.raises(ValueError, match="llmFallbackProvider must differ"):
-        PersonaIn(key="ab", name="A", language="en", instructions="i", greeting="g", version=1,
-                  llm_provider="groq", llm_fallback_provider="groq")

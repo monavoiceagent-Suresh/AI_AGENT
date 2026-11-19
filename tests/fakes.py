@@ -55,6 +55,40 @@ class FakeMedia:
         self.inbox.put_nowait(CallEnded("callended"))
 
 
+class RealtimeMedia(FakeMedia):
+    """Telephony leg that plays audio in real time, like Exotel: a playback clock that sent audio advances, and a
+    mark acknowledged only once the audio sent before it has played (or never, with ack_marks=False). `clear`
+    discards queued audio and its pending marks."""
+
+    def __init__(self, *, ack_marks: bool = True) -> None:
+        super().__init__()
+        self.ack_marks = ack_marks
+        self._play_until = 0.0
+        self._pending: list[asyncio.TimerHandle] = []
+
+    async def send_audio(self, pcm: bytes) -> None:
+        self.audio.extend(pcm)
+        now = asyncio.get_running_loop().time()
+        self._play_until = max(self._play_until, now) + len(pcm) / (2 * self.sample_rate)
+
+    async def mark(self, name: str) -> None:
+        self.marks.append(name)
+        if self.ack_marks:
+            loop = asyncio.get_running_loop()
+            at = max(self._play_until, loop.time())
+            self._pending.append(loop.call_at(at, self.inbox.put_nowait, PlaybackMark(name)))
+
+    async def clear(self) -> None:
+        self.clears += 1
+        self._play_until = 0.0
+        for handle in self._pending:
+            handle.cancel()
+        self._pending.clear()
+
+    def playback_remaining(self) -> float:
+        return max(0.0, self._play_until - asyncio.get_running_loop().time())
+
+
 class FakeASR:
     def __init__(self) -> None:
         self.queue: asyncio.Queue[PartialTranscript | CommittedTranscript] = asyncio.Queue()

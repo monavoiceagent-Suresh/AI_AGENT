@@ -7,8 +7,8 @@ from app.models import AgentIn
 from tests.fakes import make_settings
 
 
-def agent(language: str) -> AgentIn:
-    return AgentIn(name="A", language=language, instructions="x", greeting="Hi")
+def agent(language: str, **overrides) -> AgentIn:
+    return AgentIn(name="A", language=language, instructions="x", greeting="Hi", **overrides)
 
 
 def test_default_configuration_is_elevenlabs_premium_primary_bakbak_fallback():
@@ -19,8 +19,29 @@ def test_default_configuration_is_elevenlabs_premium_primary_bakbak_fallback():
     assert Settings.model_fields["tts_provider"].default == "elevenlabs_premium"
     assert Settings.model_fields["tts_fallback_provider"].default == "bakbak"
     cfg = make_settings(tts_fallback_provider="bakbak")
-    assert voice_for(agent("te"), cfg) == Voice(voice_id="el-voice", model_id="eleven_v3")
+    # Both ElevenLabs tiers default to Flash v2.5 now that eleven_v3 is not allowed.
+    assert voice_for(agent("ta"), cfg) == Voice(voice_id="el-voice", model_id="eleven_flash_v2_5")
     assert fallback_voice_for(agent("te"), cfg) == Voice(voice_id="te-voice", model_id="standard")
+
+
+def test_eleven_v3_is_never_used_whatever_chose_it():
+    from app.calls import validate_agent, with_call_voice
+
+    # A Railway env value of eleven_v3 is replaced by the default model.
+    cfg = make_settings(elevenlabs_premium_model_id="eleven_v3", elevenlabs_tts_model_id="eleven_v3")
+    assert cfg.elevenlabs_premium_model_id == "eleven_flash_v2_5" == cfg.elevenlabs_tts_model_id
+    # So is an agent's stored choice, or a campaign's saved voice model.
+    assert voice_for(agent("en", tts_model_id="eleven_v3"), cfg).model_id == "eleven_flash_v2_5"
+    assert validate_agent(agent("en", tts_model_id="eleven_v3"), cfg) is None
+    assert with_call_voice(agent("en"), "campaign-voice", "eleven_v3").tts_model_id == "eleven_flash_v2_5"
+    # An explicit multilingual_v2 choice (the allowed alternative) is honoured, not overridden by a default.
+    assert voice_for(agent("hi", tts_model_id="eleven_multilingual_v2"), cfg).model_id == "eleven_multilingual_v2"
+
+
+def test_telugu_cannot_be_spoken_by_elevenlabs_without_eleven_v3():
+    from app.calls import validate_agent
+
+    assert "cannot speak language 'te'" in validate_agent(agent("te"), make_settings())
 
 
 def test_bakbak_primary_falls_back_to_elevenlabs_standard_for_supported_languages():

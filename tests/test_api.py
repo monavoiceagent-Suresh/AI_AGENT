@@ -136,6 +136,10 @@ def client(monkeypatch):
         "EXOTEL_INR_PER_MINUTE": "0.6",
         "DASHBOARD_WEBHOOK_SECRET": "test-dashboard-secret",
         "DISPATCHER_POLL_SECONDS": "0.05",
+        # Test isolation: a request that escapes the fakes below fails fast on a closed local port instead of
+        # reaching the real (paid) LLM gateways configured in .env.
+        "OPENROUTER_BASE_URL": "http://127.0.0.1:9/no-real-llm-in-tests",
+        "GROQ_BASE_URL": "http://127.0.0.1:9/no-real-llm-in-tests",
     }.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
@@ -152,6 +156,12 @@ def client(monkeypatch):
             )
             svc.tts = FakeTTS()
             svc.exotel = FakeExotel()
+            # Each call resolves its LLM from llm_by_provider and its ASR fallback from fallback_asr/asr_by_provider
+            # (app/calls.py), which main.py fills with real clients from .env: with these emptied, every call uses
+            # the fakes above, and no test can reach a real OpenRouter or Deepgram account.
+            svc.llm_by_provider = {}
+            svc.fallback_asr = None
+            svc.asr_by_provider = {}
             yield test_client
     finally:
         get_settings.cache_clear()

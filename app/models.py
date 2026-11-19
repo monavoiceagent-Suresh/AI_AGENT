@@ -7,16 +7,18 @@ from pydantic.alias_generators import to_camel
 
 from app.config import ASRProvider, LLMProvider, TTSProvider
 from app.phone import indian_number_problem
+from app.recognition import MAX_HINTS_CHARS
 
 Language = Literal["en", "hi", "ta", "te"]
 Workflow = Literal["general", "lead_qualification", "faq", "appointment", "order"]
 
-# Languages each supported ElevenLabs TTS model can speak (of the ones this platform offers).
-# Telugu is only covered by eleven_v3: https://elevenlabs.io/docs/overview/models
+# Languages each selectable ElevenLabs TTS model can speak (of the ones this platform offers):
+# https://elevenlabs.io/docs/overview/models. eleven_v3 is deliberately not selectable (latency and cost); a
+# stored eleven_v3 choice is replaced by eleven_flash_v2_5 at call time (app/config.py normalize_tts_model).
+# No selectable ElevenLabs model speaks Telugu.
 TTS_MODEL_LANGUAGES: dict[str, set[str]] = {
     "eleven_flash_v2_5": {"en", "hi", "ta"},
     "eleven_multilingual_v2": {"en", "hi", "ta"},
-    "eleven_v3": {"en", "hi", "ta", "te"},
 }
 
 
@@ -39,6 +41,12 @@ class AgentIn(BaseModel):
     instructions: str = Field(min_length=1, description="Persona, business context and goals.")
     greeting: str = Field(min_length=1, description="First sentence spoken when the call connects.")
     knowledge: str = Field("", description="Facts and FAQ answers the agent may use.")
+    recognition_hints: str = Field(
+        "",
+        max_length=MAX_HINTS_CHARS,
+        description="Business vocabulary for speech recognition (comma/line separated). Sent to the ASR "
+        "provider as keyterms (app/recognition.py), never to the LLM. Empty keeps plain recognition.",
+    )
     collect_fields: list[str] = Field(
         default_factory=list,
         description="Details to gather (lead qualification / appointment), e.g. name, budget.",
@@ -63,10 +71,10 @@ class AgentIn(BaseModel):
         None, description="ElevenLabs stability/similarity_boost/style overrides for voice_id. Only ElevenLabs reads this."
     )
     llm_model: str | None = Field(
-        None,
-        description=(
-            "Overrides the primary model (OPENROUTER_MODEL) for this agent. The fallback always uses GROQ_MODEL."
-        ),
+        None, max_length=200, description="Overrides the primary OpenRouter model (OPENROUTER_MODEL) for this agent."
+    )
+    llm_fallback_model: str | None = Field(
+        None, max_length=200, description="Overrides the fallback OpenRouter model (LLM_FALLBACK_MODEL) for this agent."
     )
     llm_provider: LLMProvider | None = Field(None, description="Overrides LLM_PROVIDER for this agent.")
     llm_fallback_provider: LLMProvider | None = Field(
@@ -201,6 +209,8 @@ class PersonaIn(_Camel):
     instructions: str = Field(min_length=1)
     greeting: str = Field(min_length=1)
     knowledge: str = ""
+    # Speech-recognition vocabulary (app/recognition.py). Omitted/empty means plain recognition, as before.
+    recognition_hints: str = Field("", max_length=MAX_HINTS_CHARS)
     version: int = Field(ge=1)
     # The workspace's own Call Outcome Rules, current when this was sent. Empty means the engine
     # classifies into its own fixed per-workflow list, exactly as before these fields existed.
@@ -215,6 +225,7 @@ class PersonaIn(_Camel):
     llm_provider: LLMProvider | None = None
     llm_fallback_provider: LLMProvider | None = None
     llm_model: str | None = Field(None, max_length=200)
+    llm_fallback_model: str | None = Field(None, max_length=200)
 
     @model_validator(mode="after")
     def _check_outcome_rules(self) -> Self:
@@ -450,6 +461,15 @@ class CallTurn(BaseModel):
     llm_ttft_ms: int | None
     tts_ttfb_ms: int | None
     response_latency_ms: int | None
+    # Delivery, kept distinct: sentences whose audio was transmitted to Exotel, sentences Exotel confirmed it
+    # played (marks), and whether every transmitted sentence was confirmed. None on turns saved before these.
+    sentences_sent: int | None = None
+    sentences_confirmed: int | None = None
+    playback_confirmed: bool | None = None
+    # Why this turn ended early (barge_in, superseded, call_ended) or failed (llm/tts/send failure category).
+    interrupted_by: str | None = None
+    failure_reason: str | None = None
+    llm_model: str | None = None
 
 
 class Call(BaseModel):

@@ -18,8 +18,8 @@ AGENT_COLUMNS = (
     "outcome_rules, outcome_fallback, "
     "voice_id, tts_model_id, llm_model, "
     "asr_provider, asr_fallback_provider, tts_provider, tts_fallback_provider, "
-    "llm_provider, llm_fallback_provider, "
-    "is_inbound_default, client_id, persona_key"
+    "llm_provider, llm_fallback_provider, llm_fallback_model, "
+    "is_inbound_default, client_id, persona_key, recognition_hints"
 )
 _AGENT_PLACEHOLDERS = ", ".join(f"${n}" for n in range(1, len(AGENT_COLUMNS.split(",")) + 1))
 _AGENT_UPDATE_PLACEHOLDERS = ", ".join(f"${n}" for n in range(2, len(AGENT_COLUMNS.split(",")) + 2))
@@ -78,9 +78,11 @@ def _agent_args(agent: AgentIn) -> tuple[Any, ...]:
         agent.tts_fallback_provider,
         agent.llm_provider,
         agent.llm_fallback_provider,
+        agent.llm_fallback_model,
         agent.is_inbound_default,
         agent.client_id,
         agent.persona_key,
+        agent.recognition_hints,
     )
 
 
@@ -223,7 +225,9 @@ async def finish_call(
         )
         await conn.executemany(
             "INSERT INTO call_turns (call_id, idx, user_text, agent_text, interrupted, endpointing_ms, "
-            "llm_ttft_ms, tts_ttfb_ms, response_latency_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "llm_ttft_ms, tts_ttfb_ms, response_latency_ms, sentences_sent, sentences_confirmed, "
+            "playback_confirmed, interrupted_by, failure_reason, llm_model) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
             [
                 (
                     call_id,
@@ -235,6 +239,12 @@ async def finish_call(
                     t["llm_ttft_ms"],
                     t["tts_ttfb_ms"],
                     t["response_latency_ms"],
+                    t.get("sentences_sent"),
+                    t.get("sentences_confirmed"),
+                    t.get("playback_confirmed"),
+                    t.get("interrupted_by"),
+                    t.get("failure_reason"),
+                    t.get("llm_model"),
                 )
                 for t in turns
             ],
@@ -258,9 +268,23 @@ async def save_recording_url(pool: asyncpg.Pool, call_sid: str, url: str) -> Non
 async def apply_status_callback(pool: asyncpg.Pool, call_sid: str, status: str) -> bool:
     """Record a terminal Exotel status for calls whose media stream never connected."""
     result = await pool.execute(
-        "UPDATE calls SET status = $2, ended_at = now() WHERE exotel_call_sid = $1 AND status = 'initiated'",
+        "UPDATE calls SET status = $2, end_reason = $3, ended_at = now() "
+        "WHERE exotel_call_sid = $1 AND status = 'initiated'",
         call_sid,
         status,
+        f"exotel:{status}",
+    )
+    return result != "UPDATE 0"
+
+
+async def mark_stream_failed(pool: asyncpg.Pool, call_sid: str, reason: str) -> bool:
+    """A placed outbound call whose media stream never started: terminal status 'stream_failed' with the reason.
+    Only a row still 'initiated' changes, so a duplicate stream for a call already running is never marked."""
+    result = await pool.execute(
+        "UPDATE calls SET status = 'stream_failed', end_reason = $2, ended_at = now() "
+        "WHERE exotel_call_sid = $1 AND status = 'initiated'",
+        call_sid,
+        reason,
     )
     return result != "UPDATE 0"
 

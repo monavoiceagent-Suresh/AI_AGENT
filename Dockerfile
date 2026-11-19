@@ -2,6 +2,8 @@ FROM ghcr.io/astral-sh/uv:0.9.15-python3.12-bookworm-slim
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+# Logs go to stdout (app/main.py); unbuffered so each line reaches Railway when it is written, not in batches.
+ENV PYTHONUNBUFFERED=1
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev

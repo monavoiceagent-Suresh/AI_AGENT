@@ -124,6 +124,44 @@ def test_versions_only_move_forward_and_a_replay_is_harmless(client):  # noqa: F
     assert client.get(f"/inbound/routes/{NUMBER}", headers=ADMIN).json()["version"] == 2
 
 
+def test_replaying_a_route_stored_before_newer_persona_fields_existed_is_unchanged(client):  # noqa: F811
+    """A route stored by an older engine has no recognition_hints (or provider) keys. Replaying the same
+    publish is "unchanged"; a real change at the same version is still a conflict."""
+    assert publish(client).json()["status"] == "applied"
+    pool = client.app.state.services.pool
+    client.portal.call(
+        pool.execute,
+        "UPDATE inbound_routes SET persona = persona - 'recognition_hints' - 'asr_provider' - 'llm_model' "
+        "WHERE phone = $1",
+        normalize_phone(NUMBER),
+    )
+    stored = client.portal.call(
+        pool.fetchval, "SELECT persona FROM inbound_routes WHERE phone = $1", normalize_phone(NUMBER)
+    )
+    assert "recognition_hints" not in stored  # really the pre-upgrade shape
+
+    assert publish(client).json()["status"] == "unchanged"
+    assert publish(client, persona=PERSONA | {"recognitionHints": ""}).json()["status"] == "unchanged"
+    changed = publish(client, persona=PERSONA | {"recognitionHints": "Sunrise Clinic"})
+    assert changed.status_code == 409 and changed.json()["detail"] == {"code": "version_conflict"}
+    republished = publish(client, version=2, persona=PERSONA | {"recognitionHints": "Sunrise Clinic"})
+    assert republished.json()["status"] == "applied"
+    dropped = publish(client, version=2)  # the same version without its hints is a real change too
+    assert dropped.status_code == 409
+
+
+def test_same_persona_compares_effective_configuration():
+    from app.inbound_db import same_persona
+    from app.models import PersonaIn
+
+    current = PersonaIn.model_validate(PERSONA | {"recognitionHints": ""}).model_dump()
+    legacy = {k: v for k, v in current.items() if k not in ("recognition_hints", "asr_provider", "outcome_rules")}
+    assert same_persona(legacy, current)
+    assert not same_persona(legacy | {"greeting": "Changed."}, current)
+    assert not same_persona(current | {"recognition_hints": "RFID"}, current)
+    assert not same_persona({"not": "a persona"}, current) and not same_persona("text", current)
+
+
 def test_a_number_never_moves_to_another_workspace(client):  # noqa: F811
     assert publish(client).status_code == 200
     taken = publish(client, clientId="client-2", version=9, persona=PERSONA | {"instructions": "Not yours."})
@@ -380,4 +418,9 @@ def test_the_saved_route_carries_the_agent_persona_and_workspace_it_was_publishe
         "asr_fallback_provider": None,
         "tts_provider": None,
         "tts_fallback_provider": None,
+        "llm_provider": None,
+        "llm_fallback_provider": None,
+        "llm_model": None,
+        "llm_fallback_model": None,
+        "recognition_hints": "",
     }
