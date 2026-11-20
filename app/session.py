@@ -385,6 +385,11 @@ class VoiceSession:
     async def _on_committed(self, text: str) -> None:
         text = text.strip()
         if not text:
+            # An empty commit (VAD/endpointing triggered on noise or a breath, nothing transcribed) still ends
+            # that speech attempt: clear its tracking now, or a later empty-then-real sequence inflates the
+            # NEXT utterance's speech_ms by however long ago this one started (live: 28s on a 5-char partial).
+            self._last_partial_at = None
+            self._speech_started_at = None
             return
         now = time.monotonic()
         self._last_activity = now

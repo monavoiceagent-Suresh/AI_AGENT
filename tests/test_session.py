@@ -148,6 +148,18 @@ async def test_missing_marks_fall_back_to_playback_clock():
     assert session.turns[0]["agent_text"] == "Hello, how can I help?"
 
 
+async def test_empty_commit_resets_the_speech_clock():
+    """A VAD/endpointing boundary with nothing transcribed (noise, a breath) must not leave a stale
+    speech-start time running: a later real partial would otherwise inherit its age as speech_ms, making a
+    brief utterance look like it had been going on for however long ago the noise happened."""
+    session, _media, _asr = make_session(FakeLLM([]))
+    await session._on_partial("um")
+    assert session._speech_started_at is not None
+    await session._on_committed("")
+    assert session._speech_started_at is None
+    assert session._last_partial_at is None
+
+
 async def test_idle_caller_ends_the_call():
     session, media, asr = make_session(FakeLLM([]), idle_timeout_seconds=1)
     assert await asyncio.wait_for(session.run(), 5) == "idle_timeout"
