@@ -16,6 +16,7 @@ from app.providers.chat_completions import ChatCompletionsLLM
 from app.providers.deepgram_stt import DeepgramSTT
 from app.providers.deepgram_tts import DeepgramTTS
 from app.providers.elevenlabs_tts import ElevenLabsTTS
+from app.providers.sarvam_tts import SarvamTTS
 from app.providers.exotel import ExotelClient
 from app.providers.failover import FailoverLLM
 from app.providers.rate_limit import TokenBucket
@@ -84,11 +85,13 @@ def build_tts_providers(http: httpx.AsyncClient, settings) -> dict:
         else None
     )
     deepgram = DeepgramTTS(api_key=settings.deepgram_api_key.get_secret_value()) if settings.deepgram_api_key else None
+    sarvam = SarvamTTS(api_key=settings.sarvam_api_key.get_secret_value()) if settings.sarvam_api_key else None
     return {
         "elevenlabs_premium": elevenlabs,
         "elevenlabs_standard": elevenlabs,
         "bakbak": bakbak,
         "deepgram_aura": deepgram,
+        "sarvam": sarvam,
     }
 
 

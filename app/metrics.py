@@ -9,6 +9,8 @@ from app.config import Settings
 def tts_inr_per_1k_chars(settings: Settings, provider: str, model_id: str) -> float | None:
     if provider == "bakbak":
         return settings.bakbak_inr_per_1k_chars
+    if provider == "sarvam":
+        return settings.sarvam_inr_per_1k_chars
     usd = settings.elevenlabs_tts_usd_per_1k_chars.get(model_id)
     return usd * settings.usd_to_inr if usd is not None else None
 

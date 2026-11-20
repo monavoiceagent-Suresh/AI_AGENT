@@ -18,7 +18,7 @@ def normalize_tts_model(model_id: str | None) -> str | None:
     return model_id
 
 
-TTSProvider = Literal["bakbak", "elevenlabs_premium", "elevenlabs_standard", "deepgram_aura"]
+TTSProvider = Literal["bakbak", "elevenlabs_premium", "elevenlabs_standard", "deepgram_aura", "sarvam"]
 ASRProvider = Literal["elevenlabs_scribe", "deepgram_nova3"]
 LLMProvider = Literal["openrouter", "groq"]
 
@@ -64,6 +64,21 @@ class Settings(BaseSettings):
     deepgram_api_key: SecretStr | None = None
     # Aura has no Hindi/Tamil/Telugu voices; this must be an "-en" voice (see app/providers/deepgram_tts.py).
     deepgram_tts_voice: str = "aura-2-thalia-en"
+
+    sarvam_api_key: SecretStr | None = None
+    # Sarvam's only streaming model as of 2026-11-20; see app/providers/sarvam_tts.py.
+    sarvam_tts_model: str = "bulbul:v4-flash"
+    # One speaker per engine language (app/models.py Language), from Sarvam's documented bulbul:v4-flash
+    # catalogue (docs.sarvam.ai, Voices page, fetched 2026-11-20). Unlike ElevenLabs/Deepgram, Sarvam speaks
+    # all four of this engine's languages, so this is the only TTS provider usable for Telugu outside eleven_v3.
+    sarvam_tts_speakers: dict[str, str] = Field(
+        default_factory=lambda: {
+            "en": "simran_en_customer",
+            "hi": "shubh_hi_customer",
+            "ta": "gokul_ta_narration",
+            "te": "kavitha_te_conversation",
+        }
+    )
 
     # Independent primary/fallback choice for ASR and TTS. The fallback is used only when its own credentials
     # are configured; None disables that fallback entirely. Primary and fallback must differ.
@@ -173,6 +188,8 @@ class Settings(BaseSettings):
     )
     # Bakbak publishes no list price: set your contracted rate, or TTS cost is left unpriced.
     bakbak_inr_per_1k_chars: float | None = None
+    # Sarvam's pricing is plan-specific too: set your contracted rate, or TTS cost is left unpriced.
+    sarvam_inr_per_1k_chars: float | None = None
     # Exotel per-minute rate from your plan; telephony cost is omitted when unset.
     exotel_inr_per_minute: float | None = None
     target_cost_per_connected_minute_inr: float = 3.0
@@ -291,6 +308,8 @@ class Settings(BaseSettings):
             return self.bakbak_api_key is not None and bool(self.bakbak_voices)
         if provider in ("elevenlabs_premium", "elevenlabs_standard"):
             return bool(self.elevenlabs_tts_voice_id)
+        if provider == "sarvam":
+            return self.sarvam_api_key is not None
         return self.deepgram_api_key is not None  # deepgram_aura
 
     @model_validator(mode="after")

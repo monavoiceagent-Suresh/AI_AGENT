@@ -35,6 +35,7 @@ TTS_PROVIDER_LANGUAGES: dict[TTSProvider, set[str] | None] = {
     "elevenlabs_standard": {"en", "hi", "ta"},
     "deepgram_aura": {"en"},
     "bakbak": None,  # dynamic: whichever languages BAKBAK_VOICES configures
+    "sarvam": {"en", "hi", "ta", "te"},
 }
 
 
@@ -127,6 +128,9 @@ def _default_tts_voice(provider: TTSProvider, settings: Settings, language: str)
         return None
     if provider == "deepgram_aura":
         return Voice(voice_id=settings.deepgram_tts_voice, model_id="aura")
+    if provider == "sarvam":
+        speaker = settings.sarvam_tts_speakers.get(language)
+        return Voice(voice_id=speaker, model_id=settings.sarvam_tts_model) if speaker else None
     if not settings.elevenlabs_tts_voice_id:
         return None
     return Voice(voice_id=settings.elevenlabs_tts_voice_id, model_id=_elevenlabs_model_id(provider, settings))
@@ -176,8 +180,8 @@ def validate_agent(agent: AgentIn, settings: Settings) -> str | None:
         return None
     if agent.language not in (TTS_PROVIDER_LANGUAGES[provider] or ()):
         return f"TTS provider {provider!r} cannot speak language {agent.language!r}"
-    if provider == "deepgram_aura":
-        return None  # one fixed English voice; no per-agent model/voice choice to validate
+    if provider in ("deepgram_aura", "sarvam"):
+        return None  # one fixed voice per language; no per-agent model/voice choice to validate
     model = voice_for(agent, settings).model_id
     languages = TTS_MODEL_LANGUAGES.get(model)
     if languages is None:
