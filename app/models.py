@@ -434,7 +434,7 @@ class VoiceOption(_Camel):
 
 
 class VoicesOut(_Camel):
-    provider: Literal["bakbak", "elevenlabs", "deepgram"]
+    provider: Literal["bakbak", "elevenlabs", "deepgram", "sarvam"]
     voices: list[VoiceOption]
 
 
