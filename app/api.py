@@ -100,7 +100,7 @@ async def create_agent(agent: AgentIn, svc: Svc) -> Agent:
 async def list_voices(
     svc: Svc,
     provider: Annotated[
-        Literal["bakbak", "elevenlabs_premium", "elevenlabs_standard", "deepgram_aura"] | None, Query()
+        Literal["bakbak", "elevenlabs_premium", "elevenlabs_standard", "deepgram_aura", "sarvam"] | None, Query()
     ] = None,
 ) -> VoicesOut:
     """The real voices a TTS provider has right now (default: the engine's own), for the dashboard's voice picker."""

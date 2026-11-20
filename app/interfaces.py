@@ -1,6 +1,6 @@
 """Contracts between the voice-session orchestrator and the provider adapters."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Protocol
@@ -63,8 +63,11 @@ class Transcriber(Protocol):
 
 
 class ASR(Protocol):
-    def connect(self, *, language: str, sample_rate: int) -> AbstractAsyncContextManager[Transcriber]:
-        """One streaming session for one call."""
+    def connect(
+        self, *, language: str, sample_rate: int, keyterms: Sequence[str] = ()
+    ) -> AbstractAsyncContextManager[Transcriber]:
+        """One streaming session for one call. `keyterms` (app/recognition.py) bias recognition towards a
+        persona's own vocabulary; empty means the provider's plain behaviour."""
 
 
 @dataclass(frozen=True)

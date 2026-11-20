@@ -11,7 +11,7 @@ than configurable per call.
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 
@@ -26,9 +26,23 @@ LISTEN_URL = "wss://api.deepgram.com/v1/listen"
 MODEL = "nova-3"
 
 
+def _deepgram_error(message: dict, keyterms_sent: int) -> ASRError:
+    """Deepgram's streaming Error message as an ASRError. Deepgram documents no error code for a rejected
+    keyterm after the handshake (oversized keyterms are refused at the handshake with HTTP 400), so an Error is
+    treated as a rejected request only when it names keyterms and this session sent some. Unverified live."""
+    variant = str(message.get("variant") or "error")
+    text = f"{message.get('description') or ''} {message.get('message') or ''}"
+    rejected = bool(keyterms_sent) and "keyterm" in text.lower()
+    detail = "request rejected" if rejected else text.strip()[:200]
+    return ASRError(f"deepgram {variant}: {detail}", code=variant, rejected_request=rejected)
+
+
 class DeepgramSTTSession:
-    def __init__(self, ws: ClientConnection):
+    def __init__(self, ws: ClientConnection, *, keyterms_sent: int = 0):
         self._ws = ws
+        self.keyterms_sent = keyterms_sent
+        # Deepgram never echoes the keyterms it applied: acceptance is always unknown.
+        self.keyterms_accepted: int | None = None
         # Final-but-not-speech_final segments accumulate here until endpointing closes the utterance.
         self._buffer = ""
 
@@ -54,7 +68,7 @@ class DeepgramSTTSession:
                     self._buffer = f"{self._buffer} {text}".strip() if self._buffer else text
                     yield PartialTranscript(self._buffer)
             elif kind == "Error":
-                raise ASRError(f"deepgram {message.get('variant', 'error')}: {message.get('description')}")
+                raise _deepgram_error(message, self.keyterms_sent)
             # Metadata / SpeechStarted / UtteranceEnd carry nothing this adapter's contract needs.
 
 
@@ -67,22 +81,26 @@ class DeepgramSTT:
         self._url = url
 
     @asynccontextmanager
-    async def connect(self, *, language: str, sample_rate: int) -> AsyncIterator[DeepgramSTTSession]:
-        query = urlencode(
-            {
-                "model": MODEL,
-                "language": language,
-                "encoding": "linear16",
-                "sample_rate": sample_rate,
-                "channels": 1,
-                "interim_results": "true",
-                "punctuate": "true",
-                "endpointing": self._endpointing_ms,
-            }
-        )
+    async def connect(
+        self, *, language: str, sample_rate: int, keyterms: Sequence[str] = ()
+    ) -> AsyncIterator[DeepgramSTTSession]:
+        params: dict[str, object] = {
+            "model": MODEL,
+            "language": language,
+            "encoding": "linear16",
+            "sample_rate": sample_rate,
+            "channels": 1,
+            "interim_results": "true",
+            "punctuate": "true",
+            "endpointing": self._endpointing_ms,
+        }
+        if keyterms:
+            # Nova-3 keyterm prompting: the parameter is repeated, one term each (not comma-separated).
+            params["keyterm"] = list(keyterms)
+        query = urlencode(params, doseq=True)
         async with connect(
             f"{self._url}?{query}",
             additional_headers={"Authorization": f"Token {self._api_key}"},
             open_timeout=self._connect_timeout,
         ) as ws:
-            yield DeepgramSTTSession(ws)
+            yield DeepgramSTTSession(ws, keyterms_sent=len(keyterms))

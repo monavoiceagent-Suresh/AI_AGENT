@@ -141,3 +141,37 @@ async def test_a_malformed_entry_with_no_name_is_skipped_not_fabricated():
     result = await list_voices(client(handler), settings)
 
     assert [v.voice_id for v in result.voices] == ["v2"]
+
+
+async def test_extra_elevenlabs_voice_ids_are_added_with_their_own_name_and_deduplicated():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/v1/voices":
+            return httpx.Response(200, json={"voices": [{"voice_id": "e1", "name": "Rachel"}]})
+        voice = {"voice_id": "OUBMjq0LvBjb07bhwD3H", "name": "Library Voice", "labels": {"language": "hi"}}
+        return httpx.Response(200, json=voice)
+
+    extra = "OUBMjq0LvBjb07bhwD3H, e1, bad id!, OUBMjq0LvBjb07bhwD3H"
+    settings = make_settings(tts_provider="elevenlabs_standard", elevenlabs_extra_voice_ids=extra)
+    result = await list_voices(client(handler), settings)
+
+    assert [(v.voice_id, v.name, v.language) for v in result.voices] == [
+        ("e1", "Rachel", "en"),
+        ("OUBMjq0LvBjb07bhwD3H", "Library Voice", "hi"),
+    ]
+    assert seen == ["/v1/voices", "/v1/voices/OUBMjq0LvBjb07bhwD3H"]
+
+
+async def test_an_extra_voice_elevenlabs_cannot_describe_is_still_offered():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/voices":
+            return httpx.Response(200, json={"voices": []})
+        return httpx.Response(404, json={})
+
+    settings = make_settings(tts_provider="elevenlabs_standard", elevenlabs_extra_voice_ids="OUBMjq0LvBjb07bhwD3H")
+    result = await list_voices(client(handler), settings)
+
+    assert [(v.voice_id, v.name) for v in result.voices] == [("OUBMjq0LvBjb07bhwD3H", "Custom voice OUBMjq")]
+

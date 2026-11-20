@@ -23,6 +23,7 @@ PERSONA_FIELDS = (
     "instructions",
     "greeting",
     "knowledge",
+    "recognition_hints",
     "outcome_rules",
     "outcome_fallback",
     "asr_provider",
@@ -64,11 +65,13 @@ async def upsert_persona_agent(conn: asyncpg.Connection, client_id: str, persona
     return await conn.fetchval(
         "INSERT INTO agents (name, language, workflow, instructions, greeting, knowledge, outcome_rules, "
         "outcome_fallback, asr_provider, asr_fallback_provider, tts_provider, tts_fallback_provider, "
-        "llm_provider, llm_fallback_provider, llm_model, llm_fallback_model, client_id, persona_key) "
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) "
+        "llm_provider, llm_fallback_provider, llm_model, llm_fallback_model, client_id, persona_key, "
+        "recognition_hints) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) "
         "ON CONFLICT (client_id, persona_key) WHERE persona_key IS NOT NULL DO UPDATE SET "
         "name = EXCLUDED.name, workflow = EXCLUDED.workflow, instructions = EXCLUDED.instructions, "
         "greeting = EXCLUDED.greeting, knowledge = EXCLUDED.knowledge, "
+        "recognition_hints = EXCLUDED.recognition_hints, "
         "outcome_rules = EXCLUDED.outcome_rules, outcome_fallback = EXCLUDED.outcome_fallback, "
         "asr_provider = EXCLUDED.asr_provider, asr_fallback_provider = EXCLUDED.asr_fallback_provider, "
         "tts_provider = EXCLUDED.tts_provider, tts_fallback_provider = EXCLUDED.tts_fallback_provider, "
@@ -95,6 +98,7 @@ async def upsert_persona_agent(conn: asyncpg.Connection, client_id: str, persona
         persona.llm_fallback_model,
         client_id,
         persona.key,
+        persona.recognition_hints,
     )
 
 

@@ -1,6 +1,9 @@
-"""connect_asr: the connect-time-only ASR fallback. Falls back only if the primary's connection attempt
-itself fails; once a session is open, a later failure must never trigger a silent switch to the fallback,
-since that could duplicate or drop turns mid-call."""
+"""connect_asr: connecting with the primary ASR provider, else the fallback.
+
+A session that fails mid-call is now also recovered on the fallback, with uncommitted audio replayed and
+committed transcripts never repeated (tests/test_asr_recovery.py). What stays true here: the fallback is only
+touched when the primary fails, and a failure in the call itself, or while closing at its end, never switches
+providers."""
 
 from contextlib import asynccontextmanager
 
@@ -53,7 +56,7 @@ async def test_primary_connects_successfully_the_fallback_is_never_touched():
     primary, fallback = FakeASR("primary"), FakeASR("fallback")
 
     async with connect_asr(primary, fallback, language="en", sample_rate=8000) as transcriber:
-        assert transcriber.name == "primary"
+        assert transcriber.session.name == "primary"
 
     assert primary.connect_attempts == 1 and primary.closed_cleanly
     assert fallback.connect_attempts == 0
@@ -64,7 +67,7 @@ async def test_primary_connect_failure_falls_back():
     fallback = FakeASR("fallback")
 
     async with connect_asr(primary, fallback, language="en", sample_rate=8000) as transcriber:
-        assert transcriber.name == "fallback"
+        assert transcriber.session.name == "fallback"
 
     assert primary.connect_attempts == 1
     assert fallback.connect_attempts == 1 and fallback.closed_cleanly
@@ -78,18 +81,16 @@ async def test_primary_connect_failure_with_no_fallback_configured_raises():
             pass
 
 
-async def test_a_mid_session_failure_is_never_retried_on_the_fallback():
-    """The critical safety property: once connected, a later failure must propagate, not silently switch
-    providers (which could lose or duplicate turns already in progress)."""
+async def test_a_failure_while_closing_at_the_end_of_the_call_never_switches_providers():
+    """The call is over: an error from the provider's own close is not a reason to open another session."""
     primary = FakeASR("primary", fails_mid_session=True)
     fallback = FakeASR("fallback")
 
-    with pytest.raises(RuntimeError, match="primary dropped mid-session"):
-        async with connect_asr(primary, fallback, language="en", sample_rate=8000):
-            pass  # the body runs fine; the failure happens on the primary's own context-manager exit
+    async with connect_asr(primary, fallback, language="en", sample_rate=8000):
+        pass  # the body runs fine; the failure happens on the primary's own context-manager exit
 
-    assert primary.connect_attempts == 1
-    assert fallback.connect_attempts == 0  # never touched: the connection had already succeeded
+    assert primary.connect_attempts == 1 and primary.closed_cleanly
+    assert fallback.connect_attempts == 0
 
 
 async def test_a_failure_raised_inside_the_call_body_also_never_falls_back():

@@ -7,6 +7,7 @@ instead of guessing at one.
 
 import asyncio
 import io
+import re
 import wave
 from contextlib import aclosing
 from typing import Any
@@ -20,6 +21,7 @@ from app.models import VoiceOption, VoicesOut
 BAKBAK_TIMEOUT_SECONDS = 10
 ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
 ELEVENLABS_TIMEOUT_SECONDS = 10
+_VOICE_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 # Deepgram Aura has no list-voices endpoint: its voices are a fixed catalogue of model names, not an account's
 # own data. This is the Aura-2 English catalogue from https://developers.deepgram.com/docs/tts-models
@@ -194,6 +196,35 @@ def _parse_elevenlabs(payload: Any) -> list[VoiceOption]:
     return options
 
 
+def _extra_voice_ids(settings: Settings) -> list[str]:
+    ids = [part.strip() for part in settings.elevenlabs_extra_voice_ids.split(",")]
+    return [voice_id for voice_id in dict.fromkeys(ids) if _VOICE_ID.match(voice_id)]
+
+
+async def _with_extra_elevenlabs_voices(
+    http: httpx.AsyncClient, settings: Settings, options: list[VoiceOption]
+) -> list[VoiceOption]:
+    """Append the configured ELEVENLABS_EXTRA_VOICE_IDS that the account's own list lacks. A voice's name and
+    language are read from ElevenLabs when it answers; otherwise the voice is still offered under a generic name."""
+    known = {option.voice_id for option in options}
+    headers = {"xi-api-key": settings.elevenlabs_api_key.get_secret_value()}
+    for voice_id in _extra_voice_ids(settings):
+        if voice_id in known:
+            continue
+        found: list[VoiceOption] = []
+        try:
+            response = await http.get(
+                f"{ELEVENLABS_VOICES_URL}/{voice_id}", headers=headers, timeout=ELEVENLABS_TIMEOUT_SECONDS
+            )
+            if response.status_code < 400:
+                found = _parse_elevenlabs([response.json()])
+        except (httpx.HTTPError, ValueError):
+            pass
+        fallback = VoiceOption(voice_id=voice_id, name=f"Custom voice {voice_id[:6]}", language="en")
+        options.append(found[0] if found else fallback)
+    return options
+
+
 async def list_voices(http: httpx.AsyncClient, settings: Settings, provider: TTSProvider | None = None) -> VoicesOut:
     """The voices of `provider` (a workspace/persona choice), else of the engine's global TTS_PROVIDER."""
     provider = provider or settings.tts_provider
@@ -235,4 +266,7 @@ async def list_voices(http: httpx.AsyncClient, settings: Settings, provider: TTS
         payload = response.json()
     except ValueError as exc:
         raise VoicesUnavailable(f"{vendor} voices endpoint sent an unreadable answer") from exc
-    return VoicesOut(provider=vendor, voices=parse(payload))
+    voices = parse(payload)
+    if vendor == "elevenlabs":
+        voices = await _with_extra_elevenlabs_voices(http, settings, voices)
+    return VoicesOut(provider=vendor, voices=voices)

@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     elevenlabs_premium_model_id: str = "eleven_flash_v2_5"
     # Needed only when ElevenLabs is a configured TTS provider (primary or fallback, either tier).
     elevenlabs_tts_voice_id: str = ""
+    # Comma-separated ElevenLabs voice IDs added to the voice picker and its preview even when they are not in the
+    # account's own voice list (GET /v1/voices). Empty (the default) lists only the account's voices.
+    elevenlabs_extra_voice_ids: str = ""
     elevenlabs_tts_stability: float = 0.5
     elevenlabs_tts_similarity_boost: float = 0.75
 
@@ -178,7 +181,20 @@ class Settings(BaseSettings):
     tts_timeout_ms: int = 5000
 
     usd_to_inr: float = 85.0
+    # ASR rates, per provider (app/metrics.py). Each is configurable; sources as read on 2026-11-18:
+    # - ELEVENLABS_ASR_USD_PER_HOUR is this engine's long-standing configured value, kept unchanged so cost figures
+    #   stay comparable with earlier calls. ElevenLabs' public API pricing (elevenlabs.io/pricing/api) lists
+    #   Scribe v2 Realtime at $0.22/hour; set this to your own plan's rate.
     elevenlabs_asr_usd_per_hour: float = 0.39
+    # elevenlabs.io/pricing/api, Speech to Text table, "Scribe v3 Live, Scribe v2 Realtime" row, "Keyterm prompting
+    # (per hour)": $0.080. (The same page's FAQ says $0.05, which matches the batch table, not realtime.)
+    elevenlabs_asr_keyterms_usd_per_hour: float = 0.08
+    # deepgram.com/pricing, Speech-to-text, Streaming, "Nova-3 Monolingual": $0.0048/min Pay as you go, shown as
+    # promo pricing ("was $0.0077"); $0.0042 on Growth.
+    deepgram_asr_usd_per_minute: float = 0.0048
+    # deepgram.com/pricing, Speech-to-text add-ons, Streaming, "Keyterm Prompting": $0.0013/min Pay as you go
+    # ($0.0011 on Growth), "billed on top of transcription".
+    deepgram_asr_keyterms_usd_per_minute: float = 0.0013
     elevenlabs_tts_usd_per_1k_chars: dict[str, float] = Field(
         default_factory=lambda: {
             "eleven_flash_v2_5": 0.04,

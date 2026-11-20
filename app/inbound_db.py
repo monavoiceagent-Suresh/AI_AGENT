@@ -3,9 +3,10 @@
 from typing import Literal
 
 import asyncpg
+from pydantic import ValidationError
 
 from app import dispatch_db
-from app.models import InboundRoutePublishIn
+from app.models import InboundRoutePublishIn, PersonaIn
 
 
 class StaleVersion(Exception):
@@ -20,6 +21,23 @@ class VersionConflict(Exception):
 
 class NumberTaken(Exception):
     """The number is routed for a different workspace."""
+
+
+def same_persona(stored: object, persona: dict) -> bool:
+    """Whether a stored route's persona has the same effective configuration as `persona` (a PersonaIn dump).
+
+    A route stored by an older engine lacks the fields added since (recognition_hints, provider overrides,
+    outcome rules); read back through PersonaIn, those take the same defaults the engine applies at call time,
+    so a replay of that same publish is "unchanged" rather than a conflict. Any field whose value really
+    differs still compares unequal. A stored persona that no longer validates is compared as stored."""
+    if stored == persona:
+        return True
+    if not isinstance(stored, dict):
+        return False
+    try:
+        return PersonaIn.model_validate(stored).model_dump() == persona
+    except ValidationError:
+        return False
 
 
 async def find_route(pool: asyncpg.Pool, phone: str) -> asyncpg.Record | None:
@@ -86,7 +104,7 @@ async def publish_route(
                 if (
                     current["client_id"] == request.client_id
                     and current["active"] == request.active
-                    and current["persona"] == persona
+                    and same_persona(current["persona"], persona)
                 ):
                     return "unchanged"
                 raise VersionConflict

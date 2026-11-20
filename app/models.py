@@ -7,6 +7,7 @@ from pydantic.alias_generators import to_camel
 
 from app.config import ASRProvider, LLMProvider, TTSProvider
 from app.phone import indian_number_problem
+from app.recognition import MAX_HINTS_CHARS
 
 Language = Literal["en", "hi", "ta", "te"]
 Workflow = Literal["general", "lead_qualification", "faq", "appointment", "order"]
@@ -40,6 +41,12 @@ class AgentIn(BaseModel):
     instructions: str = Field(min_length=1, description="Persona, business context and goals.")
     greeting: str = Field(min_length=1, description="First sentence spoken when the call connects.")
     knowledge: str = Field("", description="Facts and FAQ answers the agent may use.")
+    recognition_hints: str = Field(
+        "",
+        max_length=MAX_HINTS_CHARS,
+        description="Business vocabulary for speech recognition (comma/line separated). Sent to the ASR "
+        "provider as keyterms (app/recognition.py), never to the LLM. Empty keeps plain recognition.",
+    )
     collect_fields: list[str] = Field(
         default_factory=list,
         description="Details to gather (lead qualification / appointment), e.g. name, budget.",
@@ -202,6 +209,8 @@ class PersonaIn(_Camel):
     instructions: str = Field(min_length=1)
     greeting: str = Field(min_length=1)
     knowledge: str = ""
+    # Speech-recognition vocabulary (app/recognition.py). Omitted/empty means plain recognition, as before.
+    recognition_hints: str = Field("", max_length=MAX_HINTS_CHARS)
     version: int = Field(ge=1)
     # The workspace's own Call Outcome Rules, current when this was sent. Empty means the engine
     # classifies into its own fixed per-workflow list, exactly as before these fields existed.

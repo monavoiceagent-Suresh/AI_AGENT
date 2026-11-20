@@ -2,9 +2,8 @@
 
 import asyncio
 import logging
-import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -13,10 +12,11 @@ from typing import NamedTuple
 import asyncpg
 import httpx
 
-from app import db, dispatch_db, inbound_db, metrics, prompts
+from app import db, dispatch_db, inbound_db, metrics, prompts, recognition
 from app.allocator import ChannelAllocator, new_allocation_id
+from app.asr_recovery import Leg, RecoveringTranscriber, recovering_asr
 from app.config import ASRProvider, Settings, TTSProvider, normalize_tts_model
-from app.interfaces import ASR, LLM, TTS, LLMUsage, Transcriber, Voice
+from app.interfaces import ASR, LLM, TTS, LLMUsage, Voice
 from app.models import BAKBAK_MODELS, TTS_MODEL_LANGUAGES, Agent, AgentIn, OutcomeRuleIn
 from app.phone import normalize_phone
 from app.providers.budget import BudgetedLLM
@@ -191,36 +191,35 @@ def validate_agent(agent: AgentIn, settings: Settings) -> str | None:
     return None
 
 
+def asr_legs(
+    asr: ASR, provider: str, fallback_asr: ASR | None, fallback_provider: str | None, hints: str | None
+) -> list[Leg]:
+    """This call's ASR providers in order, each with the persona's keyterms cut to that provider's own limits.
+    Parsed per call from this call's own agent: nothing is shared between calls."""
+    legs = [Leg(asr, provider, "primary", recognition.keyterms(hints, provider))]
+    if fallback_asr is not None:
+        fallback_terms = recognition.keyterms(hints, fallback_provider)
+        legs.append(Leg(fallback_asr, fallback_provider or "fallback", "fallback", fallback_terms))
+    return legs
+
+
 @asynccontextmanager
 async def connect_asr(
-    asr: ASR, fallback_asr: "ASR | None", *, language: str, sample_rate: int
-) -> AsyncIterator[Transcriber]:
-    """Connect with `asr`; if the connection itself cannot be established, try `fallback_asr` once.
-
-    This is a connect-time fallback only. Once a session is open, a later failure is never retried on the
-    other provider: doing so after audio has already been transcribed could duplicate or drop turns, so that
-    kind of mid-call failure still ends the call today, exactly as it did with a single ASR provider.
-    """
-    primary_ctx = asr.connect(language=language, sample_rate=sample_rate)
-    try:
-        transcriber = await primary_ctx.__aenter__()
-    except Exception:
-        if fallback_asr is None:
-            raise
-        log.warning("primary ASR failed to connect; using the fallback", exc_info=True)
-        async with fallback_asr.connect(language=language, sample_rate=sample_rate) as fallback_transcriber:
-            yield fallback_transcriber
-        return
-    try:
-        yield transcriber
-    except BaseException:
-        # Give the primary's own context manager a chance to see the real failure (and close itself
-        # accordingly); if it doesn't suppress it (none of our adapters do), it keeps propagating. Either
-        # way, this is a session-time failure, so it is never retried on the fallback.
-        if not await primary_ctx.__aexit__(*sys.exc_info()):
-            raise
-    else:
-        await primary_ctx.__aexit__(None, None, None)
+    asr: ASR,
+    fallback_asr: "ASR | None",
+    *,
+    language: str,
+    sample_rate: int,
+    keyterms: Sequence[str] = (),
+    provider: str = "primary",
+    fallback_provider: str = "fallback",
+) -> AsyncIterator[RecoveringTranscriber]:
+    """A recovering ASR session (app/asr_recovery.py) over `asr`, then `fallback_asr`, both with `keyterms`."""
+    legs = [Leg(asr, provider, "primary", tuple(keyterms))]
+    if fallback_asr is not None:
+        legs.append(Leg(fallback_asr, fallback_provider, "fallback", tuple(keyterms)))
+    async with recovering_asr(RecoveringTranscriber(legs, language=language, sample_rate=sample_rate)) as t:
+        yield t
 
 
 def resolve_tts(svc: "Services", agent: AgentIn) -> tuple[TTS, str, TTS | None, str | None]:
@@ -329,13 +328,17 @@ def with_persona(agent: Agent, persona: dict) -> Agent:
     back into OutcomeRuleIn here rather than leaving the agent with raw dicts where prompts.py expects
     .name/.definition attributes.
     """
-    text_fields = [f for f in dispatch_db.PERSONA_FIELDS if f not in ("outcome_rules", "outcome_fallback")]
+    text_fields = [
+        f for f in dispatch_db.PERSONA_FIELDS if f not in ("outcome_rules", "outcome_fallback", "recognition_hints")
+    ]
     update = {
         field: (persona.get(field) if field in dispatch_db.PERSONA_OPTIONAL_FIELDS else persona[field])
         for field in text_fields
     }
     update["outcome_rules"] = [OutcomeRuleIn(**r) for r in persona.get("outcome_rules", [])]
     update["outcome_fallback"] = persona.get("outcome_fallback")
+    # A route or job published before recognition hints existed has no key: no hints, exactly as before.
+    update["recognition_hints"] = persona.get("recognition_hints") or ""
     return agent.model_copy(update=update)
 
 
@@ -579,7 +582,12 @@ async def run_call(
     settings = svc.settings
     config = session_config(agent, settings, caller_context)
     tts, tts_provider_name, fallback_tts, fallback_tts_provider_name = resolve_tts(svc, agent)
-    asr, _, fallback_asr, _ = resolve_asr(svc, agent)
+    asr, asr_name, fallback_asr, fallback_asr_name = resolve_asr(svc, agent)
+    transcriber = RecoveringTranscriber(
+        asr_legs(asr, asr_name, fallback_asr, fallback_asr_name, agent.recognition_hints),
+        language=agent.language,
+        sample_rate=media.sample_rate,
+    )
     started_at = datetime.now(UTC)
     started = time.monotonic()
     call_id = await db.start_call(
@@ -602,9 +610,7 @@ async def run_call(
     # Fresh per call: it only caps this one call's own requests, on top of each provider's own shared throttle.
     call_llm = BudgetedLLM(resolve_llm(svc, agent), max_requests=settings.llm_max_requests_per_call, call_sid=start.call_sid)
     try:
-        async with connect_asr(
-            asr, fallback_asr, language=agent.language, sample_rate=media.sample_rate
-        ) as transcriber:
+        async with recovering_asr(transcriber):
             session = VoiceSession(
                 config,
                 media=media,
@@ -647,6 +653,7 @@ async def run_call(
                 campaign_id,
                 tts_provider_name,
                 fallback_tts_provider_name,
+                transcriber.usage(),
             )
         )
     )
@@ -710,6 +717,7 @@ async def _finalize(
     campaign_id: int | None,
     tts_provider_name: str,
     fallback_tts_provider_name: str | None,
+    asr_usage: dict | None = None,
 ) -> None:
     settings = svc.settings
     turns = session.turns if session else []
@@ -718,6 +726,8 @@ async def _finalize(
     llm_usage = (session.llm_usage if session else LLMUsage(0, 0, 0.0)) + extraction_usage
     usage = {
         "asr_seconds": round(session.asr_seconds, 2) if session else 0.0,
+        # Which provider(s) served the call, keyterms sent/confirmed, recovery outcome (app/asr_recovery.py).
+        **(asr_usage or {}),
         "tts_provider": tts_provider_name,
         "tts_model_id": config.voice.model_id,
         "tts_characters": session.tts_characters if session else 0,
@@ -733,6 +743,7 @@ async def _finalize(
         settings,
         connected_seconds=connected_seconds,
         asr_seconds=usage["asr_seconds"],
+        asr_segments=usage.get("asr_segments"),
         tts_usage=[
             (
                 usage["tts_characters"],
