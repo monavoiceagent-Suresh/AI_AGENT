@@ -26,6 +26,15 @@ FALLBACK_PHRASES = {
     "te": "క్షమించండి, నాకు ఇప్పుడు కొంచెం ఇబ్బందిగా ఉంది. దయచేసి మళ్లీ చెప్పగలరా?",
 }
 
+# Spoken once after SILENCE_NUDGE_SECONDS of caller silence (app/session.py _watchdog), before the full
+# idle_timeout_seconds ends the call outright. Covers both a genuinely quiet caller and a missed ASR commit.
+SILENCE_NUDGE_PHRASES = {
+    "en": "Are you still there?",
+    "hi": "क्या आप अभी भी वहाँ हैं?",
+    "ta": "நீங்கள் இன்னும் அங்கே இருக்கிறீர்களா?",
+    "te": "మీరు ఇంకా అక్కడ ఉన్నారా?",
+}
+
 WORKFLOW_GOALS = {
     "general": "Help the caller with their request.",
     "lead_qualification": (

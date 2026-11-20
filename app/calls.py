@@ -290,6 +290,8 @@ def session_config(agent: Agent, settings: Settings, caller_context: str) -> Ses
         llm_model=llm_model_for_agent(agent, settings),
         barge_in=settings.barge_in_enabled,
         idle_timeout_seconds=settings.session_idle_timeout_seconds,
+        silence_nudge_seconds=settings.session_silence_nudge_seconds,
+        silence_nudge_phrase=prompts.SILENCE_NUDGE_PHRASES[agent.language],
         max_duration_seconds=settings.max_call_duration_seconds,
         log_transcripts=settings.log_transcripts,
         llm_dedup_window_ms=settings.llm_dedup_window_ms,

@@ -107,6 +107,10 @@ class SessionConfig:
     barge_in_min_speech_ms: int = 400
     # The greeting cannot be interrupted until its audio has played this long.
     greeting_protect_ms: int = 2500
+    # Spoken once after this many seconds of caller silence, before idle_timeout_seconds ends the call
+    # outright. 0 disables the nudge.
+    silence_nudge_seconds: float = 0
+    silence_nudge_phrase: str = ""
 
 
 @dataclass
@@ -122,6 +126,7 @@ class _Response:
     end_call: bool = False
     audio_started_at: float | None = None
     draining: bool = False  # everything is sent; only waiting for playback to finish/confirm
+    is_nudge: bool = False  # a silence check-in (_watchdog), not a greeting or an LLM-driven reply
     llm_model: str | None = None
     llm_ttft_ms: int | None = None
     tts_ttfb_ms: int | None = None
@@ -203,6 +208,7 @@ class VoiceSession:
         self._last_partial_at: float | None = None
         self._speech_started_at: float | None = None
         self._last_activity = time.monotonic()
+        self._nudged = False
         self._hangup = asyncio.Event()
         self._hangup_reason = "agent_ended"
         # Guards against the LLM call paths this module controls: a redelivered commit of the same utterance,
@@ -290,6 +296,15 @@ class VoiceSession:
             now = time.monotonic()
             if now - started >= self.config.max_duration_seconds:
                 return "max_duration"
+            if (
+                self.config.silence_nudge_seconds
+                and not self._nudged
+                and not self._responding()
+                and not self._pending_user
+                and now - self._last_activity >= self.config.silence_nudge_seconds
+            ):
+                self._nudged = True
+                self._start_response(user_text="", committed_at=now, endpointing_ms=None, is_nudge=True)
             if not self._responding() and now - self._last_activity >= self.config.idle_timeout_seconds:
                 return "idle_timeout"
 
@@ -355,6 +370,7 @@ class VoiceSession:
             self._speech_started_at = now
         self._last_partial_at = now
         self._last_activity = now
+        self._nudged = False
         response = self._response
         if not (self.config.barge_in and self._responding() and response is not None):
             return
@@ -372,6 +388,7 @@ class VoiceSession:
             return
         now = time.monotonic()
         self._last_activity = now
+        self._nudged = False
         if self.config.log_transcripts:
             log.info("caller: %s", text)
         if self._is_duplicate_redelivery(text, now):
@@ -426,10 +443,12 @@ class VoiceSession:
     def _responding(self) -> bool:
         return self._response_task is not None and not self._response_task.done()
 
-    def _start_response(self, *, user_text: str | None, committed_at: float, endpointing_ms: int | None) -> None:
+    def _start_response(
+        self, *, user_text: str | None, committed_at: float, endpointing_ms: int | None, is_nudge: bool = False
+    ) -> None:
         self._pending_user = ""
         self._next_response_id += 1
-        self._response = _Response(self._next_response_id, user_text, committed_at, endpointing_ms)
+        self._response = _Response(self._next_response_id, user_text, committed_at, endpointing_ms, is_nudge=is_nudge)
         self._response_task = asyncio.create_task(self._respond(self._response))
         if user_text:
             self._last_dispatched_text = _normalize(user_text)
@@ -462,6 +481,10 @@ class VoiceSession:
             splitter = SentenceSplitter()
             for sentence in [*splitter.push(self.config.greeting), *splitter.finish()]:
                 sentences.put_nowait(sentence)
+            sentences.put_nowait(None)
+        elif response.is_nudge:
+            producer = None
+            sentences.put_nowait(self.config.silence_nudge_phrase)
             sentences.put_nowait(None)
         else:
             messages = [*self.history, {"role": "user", "content": response.user_text}]
@@ -506,7 +529,11 @@ class VoiceSession:
                 producer.cancel()
         self._consecutive_llm_failures = 0
         self._finish_turn(response, interrupted=False)
-        self._last_activity = time.monotonic()
+        if not response.is_nudge:
+            # A nudge is itself a side effect of silence: speaking it must not restart the idle clock it was
+            # meant to run alongside, or the caller would never actually hit idle_timeout.
+            self._last_activity = time.monotonic()
+            self._nudged = False
         if response.end_call:
             self._end_call("agent_ended")
         elif self._pending_user:

@@ -153,6 +153,42 @@ async def test_idle_caller_ends_the_call():
     assert await asyncio.wait_for(session.run(), 5) == "idle_timeout"
 
 
+async def test_silence_nudge_speaks_once_then_idle_timeout_still_ends_the_call():
+    session, media, asr = make_session(
+        FakeLLM([]),
+        idle_timeout_seconds=3,
+        silence_nudge_seconds=1,
+        silence_nudge_phrase="Are you still there?",
+    )
+    assert await asyncio.wait_for(session.run(), 8) == "idle_timeout"
+    # greeting, then exactly one nudge before the call ends
+    assert [t["agent_text"] for t in session.turns] == ["Hello, how can I help?", "Are you still there?"]
+
+
+async def test_no_nudge_when_disabled():
+    session, media, asr = make_session(FakeLLM([]), idle_timeout_seconds=1, silence_nudge_seconds=0)
+    assert await asyncio.wait_for(session.run(), 5) == "idle_timeout"
+    assert [t["agent_text"] for t in session.turns] == ["Hello, how can I help?"]
+
+
+async def test_caller_speech_before_the_nudge_threshold_pre_empts_it():
+    session, media, asr = make_session(
+        FakeLLM(["Sure, we're open."]),
+        idle_timeout_seconds=60,
+        silence_nudge_seconds=2,
+        silence_nudge_phrase="Are you still there?",
+    )
+    task = asyncio.create_task(session.run())
+    await wait_for(lambda: len(session.turns) == 1)  # greeting
+    await asyncio.sleep(0.3)  # well under silence_nudge_seconds: no nudge should fire
+    media.inbox.put_nowait(CallAudio(bytes(1600)))
+    asr.say("When do you open?")
+    await wait_for(lambda: len(session.turns) == 2)
+    media.hang_up()
+    await task
+    assert [t["agent_text"] for t in session.turns] == ["Hello, how can I help?", "Sure, we're open."]
+
+
 class FailingLLM(FakeLLM):
     async def stream(self, messages, model):
         self.requests.append(messages)

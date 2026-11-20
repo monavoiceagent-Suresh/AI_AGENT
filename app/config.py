@@ -164,6 +164,10 @@ class Settings(BaseSettings):
     allocation_reservation_seconds: int = Field(90, gt=0)
 
     session_idle_timeout_seconds: int = 120
+    # After this much caller silence (no speech, no response in flight), the agent speaks a short check-in
+    # phrase once (app/prompts.py SILENCE_NUDGE_PHRASES) rather than waiting silently until idle_timeout ends
+    # the call. 0 disables the nudge entirely.
+    session_silence_nudge_seconds: int = Field(8, ge=0)
     # Silence after speech before Scribe commits a transcript (end of user turn).
     endpointing_min_silence_ms: int = 300
     barge_in_enabled: bool = True
@@ -316,6 +320,12 @@ class Settings(BaseSettings):
     def _check_inbound_reserve(self) -> Self:
         if self.inbound_reserved_calls > self.max_concurrent_calls:
             raise ValueError("INBOUND_RESERVED_CALLS cannot exceed MAX_CONCURRENT_CALLS")
+        return self
+
+    @model_validator(mode="after")
+    def _check_silence_nudge(self) -> Self:
+        if self.session_silence_nudge_seconds >= self.session_idle_timeout_seconds:
+            raise ValueError("SESSION_SILENCE_NUDGE_SECONDS must be less than SESSION_IDLE_TIMEOUT_SECONDS")
         return self
 
     def tts_credentials_present(self, provider: TTSProvider) -> bool:
