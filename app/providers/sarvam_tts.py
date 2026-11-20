@@ -10,6 +10,12 @@ frames, not as raw binary frames.
 
 Sarvam speaks all four of this engine's languages (en/hi/ta/te; see app/config.py sarvam_tts_speakers), unlike
 ElevenLabs (no Telugu on an allowed model) or Deepgram Aura (English only).
+
+Unlike ElevenLabs's HTTP adapter, which rides the engine's shared, connection-pooled httpx client, this opens a
+fresh WebSocket per sentence (no pooling for websockets), so a slow handshake here cannot be absorbed the way a
+pooled HTTP connection's can. CONNECT_TIMEOUT_SECONDS bounds that handshake so a stall fails over to the
+fallback TTS provider instead of leaving the caller on dead air (live: one handshake spiked to ~4.1s vs. the
+usual ~500ms, 2026-11-20).
 """
 
 import base64
@@ -22,6 +28,7 @@ from websockets.exceptions import InvalidStatus
 from app.interfaces import TTSError
 
 SPEAK_URL = "wss://api.sarvam.ai/text-to-speech/ws"
+CONNECT_TIMEOUT_SECONDS = 3.0
 
 
 class SarvamTTS:
@@ -51,7 +58,9 @@ class SarvamTTS:
             },
         }
         try:
-            async with connect(url, additional_headers={"Api-Subscription-Key": self._api_key}) as ws:
+            async with connect(
+                url, additional_headers={"Api-Subscription-Key": self._api_key}, open_timeout=CONNECT_TIMEOUT_SECONDS
+            ) as ws:
                 await ws.send(json.dumps(config))
                 await ws.send(json.dumps({"type": "text", "data": {"text": text}}))
                 await ws.send(json.dumps({"type": "flush"}))
@@ -72,3 +81,5 @@ class SarvamTTS:
                     raise TTSError("Sarvam TTS produced no audio")
         except InvalidStatus as exc:
             raise TTSError(f"Sarvam TTS failed ({exc.response.status_code})") from exc
+        except TimeoutError as exc:
+            raise TTSError(f"Sarvam TTS connection timed out (> {CONNECT_TIMEOUT_SECONDS}s)") from exc
