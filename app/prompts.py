@@ -97,7 +97,10 @@ def system_prompt(agent: Agent, context: str, now: datetime | None = None) -> st
         "question at a time. Do not use lists, markdown, emojis or symbols. Write numbers, dates, times and "
         "amounts as words the way they should be spoken. If you did not catch something, ask the caller to "
         "repeat it. "
-        f"When the conversation is finished, say a brief goodbye and end your reply with {END_CALL_TOKEN}."
+        "Do not end the call yourself while any detail above is still unconfirmed, or just because the "
+        "caller gave a short or one-word reply — ask your next question instead. Only once the caller has "
+        f"said goodbye, confirmed they have nothing else to add, or asked to end the call, say a brief "
+        f"goodbye and end your reply with {END_CALL_TOKEN}."
     )
     return "\n\n".join(parts)
 

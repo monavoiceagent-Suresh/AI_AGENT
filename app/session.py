@@ -472,6 +472,7 @@ class VoiceSession:
             self._consecutive_llm_failures = 0
             self._finish_turn(response, interrupted=False)
             if response.end_call:
+                log.info("%s: agent ended the call after: %r", self._ctx(response.id), " ".join(response.sent))
                 self._end_call("agent_ended")
         else:
             self._finish_turn(response, interrupted=True, interrupted_by=interrupted_by)
@@ -540,6 +541,7 @@ class VoiceSession:
             self._last_activity = time.monotonic()
             self._nudged = False
         if response.end_call:
+            log.info("%s: agent ended the call after: %r", self._ctx(response.id), " ".join(response.sent))
             self._end_call("agent_ended")
         elif self._pending_user:
             self._start_response(user_text=self._pending_user, committed_at=time.monotonic(), endpointing_ms=None)
