@@ -7,6 +7,7 @@ instead of guessing at one.
 
 import asyncio
 import io
+import logging
 import re
 import wave
 from contextlib import aclosing
@@ -17,6 +18,8 @@ import httpx
 from app.calls import Services, _default_tts_voice
 from app.config import Settings, TTSProvider
 from app.models import VoiceOption, VoicesOut
+
+log = logging.getLogger(__name__)
 
 BAKBAK_TIMEOUT_SECONDS = 10
 ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
@@ -261,6 +264,9 @@ async def list_voices(http: httpx.AsyncClient, settings: Settings, provider: TTS
     except httpx.HTTPError as exc:
         raise VoicesUnavailable(f"{vendor} voices endpoint unreachable: {type(exc).__name__}") from exc
     if response.status_code >= 400:
+        # The provider's own error body never reaches the client (api.py collapses this to a bare 502),
+        # so log it here — it's the only place that distinguishes a bad key from a quota/plan limit.
+        log.warning("%s voices endpoint failed (%s): %s", vendor, response.status_code, response.text[:500])
         raise VoicesUnavailable(f"{vendor} voices endpoint failed ({response.status_code})")
     try:
         payload = response.json()
